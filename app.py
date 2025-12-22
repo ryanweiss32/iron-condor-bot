@@ -9,6 +9,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOptionContractsRequest
 from alpaca.trading.enums import AssetStatus, ContractType
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed  # <--- NEW IMPORT
 from datetime import datetime, timedelta, date
 import math
 import pandas as pd
@@ -63,7 +64,8 @@ def get_stock_data(sym):
         symbol_or_symbols=[sym],
         timeframe=TimeFrame.Day,
         start=datetime.now() - timedelta(days=days_back),
-        end=datetime.now()
+        end=datetime.now(),
+        feed=DataFeed.IEX  # <--- THIS FIXES THE "SIP" ERROR
     )
     return stock_client.get_stock_bars(req).df.reset_index()
 
@@ -71,10 +73,8 @@ def get_news_data(sym):
     news_client = NewsClient(API_KEY, SECRET_KEY)
     news_list = []
     try:
-        # Try specific ticker
         news_req = NewsRequest(symbols=sym, limit=5)
         news_list = news_client.get_news(news_req).news
-        # Fallback to general news if empty (common for ETFs)
         if not news_list:
             news_req = NewsRequest(limit=5)
             news_list = news_client.get_news(news_req).news
@@ -128,9 +128,9 @@ if symbol:
         base_move = current_price * target_iv * math.sqrt(days_to_expiry/365)
         
         scenarios = {
-            "🚀 Aggressive (High Risk)": 0.6,  # Narrower strikes
-            "⚖️ Balanced (Standard)": 1.0,    # Standard expected move
-            "🛡️ Conservative (Safe)": 1.4     # Wider strikes
+            "🚀 Aggressive (High Risk)": 0.6,
+            "⚖️ Balanced (Standard)": 1.0,
+            "🛡️ Conservative (Safe)": 1.4
         }
         
         scenario_data = []
@@ -152,15 +152,11 @@ if symbol:
 
         with tab1:
             st.subheader("1. Choose Your Risk Profile")
-            
-            # Scenario Table
             st.dataframe(pd.DataFrame(scenario_data).set_index("Strategy"), use_container_width=True)
             
-            # Selector
             selected_strat_name = st.selectbox("Select Strategy to Simulate:", list(scenarios.keys()), index=1)
             selected_multiplier = scenarios[selected_strat_name]
             
-            # Calculate Final Strikes based on selection
             final_move = base_move * selected_multiplier
             short_call_strike = math.ceil(current_price + final_move)
             long_call_strike = short_call_strike + wing_width
@@ -173,14 +169,13 @@ if symbol:
             if st.button("🔴 Fetch Live Bid/Ask & Calculate Profit"):
                 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
                 
-                # Calculate Expiry
+                # Dynamic Expiry Calculation
                 today = date.today()
                 days_ahead = 4 - today.weekday()
                 if days_ahead <= 0: days_ahead += 7
                 expiry = today + timedelta(days=days_ahead)
                 
-                with st.spinner("Fetching real-time option chain..."):
-                    # Find Contracts
+                with st.spinner(f"Fetching option chain for {expiry}..."):
                     sc = find_contract(trading_client, symbol, short_call_strike, ContractType.CALL, expiry)
                     lc = find_contract(trading_client, symbol, long_call_strike, ContractType.CALL, expiry)
                     sp = find_contract(trading_client, symbol, short_put_strike, ContractType.PUT, expiry)
@@ -195,9 +190,16 @@ if symbol:
                         net_credit = 0.0
                         
                         for contract in legs:
-                            q = quotes[contract.symbol].latest_quote
-                            # Midpoint pricing usually gets filled
-                            mid = (q.ask_price + q.bid_price) / 2
+                            # Handle missing quotes gracefully
+                            if contract.symbol in quotes:
+                                q = quotes[contract.symbol].latest_quote
+                                mid = (q.ask_price + q.bid_price) / 2
+                                bid_txt = f"${q.bid_price:.2f}"
+                                ask_txt = f"${q.ask_price:.2f}"
+                            else:
+                                mid = 0.0
+                                bid_txt = "-"
+                                ask_txt = "-"
                             
                             if contract.strike_price in [short_call_strike, short_put_strike]:
                                 side = "SELL"
@@ -212,8 +214,8 @@ if symbol:
                                 "Side": side,
                                 "Strike": f"${contract.strike_price}",
                                 "Type": contract.type.value,
-                                "Bid": f"${q.bid_price:.2f}",
-                                "Ask": f"${q.ask_price:.2f}",
+                                "Bid": bid_txt,
+                                "Ask": ask_txt,
                                 "Mid": f"${mid:.2f}"
                             })
                             
@@ -232,9 +234,8 @@ if symbol:
                         <p><b>Win Probability:</b> {calculate_probability(current_price, short_call_strike, short_put_strike, target_iv, 7):.1f}%</p>
                         </div>
                         """, unsafe_allow_html=True)
-                        
                     else:
-                        st.error("Could not find all 4 contracts. Market might be closed.")
+                        st.error("Could not find all contracts. The market might be closed or strikes are unavailable.")
             else:
                 st.info("Click the button above to pull live pricing from the exchange.")
 
