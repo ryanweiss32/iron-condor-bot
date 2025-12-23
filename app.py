@@ -302,13 +302,209 @@ def get_stock_data(sym):
     )
     return stock_client.get_stock_bars(req).df.reset_index()
 
-def get_news_data(sym):
-    news_client = NewsClient(API_KEY, SECRET_KEY)
+def analyze_stock_for_iron_condor(symbol, price_range_category):
+    """
+    Analyze a stock's suitability for iron condor strategies
+    Returns: dict with analysis metrics
+    """
     try:
-        news_req = NewsRequest(symbols=sym, limit=5)
-        return news_client.get_news(news_req).news
-    except:
-        return []
+        # Get basic stock data
+        yf_ticker = yf.Ticker(symbol)
+        info = yf_ticker.info
+        current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+        
+        if current_price == 0:
+            return None
+        
+        # Get historical data for IV calculation
+        hist = yf_ticker.history(period="60d")
+        if len(hist) < 30:
+            return None
+        
+        # Calculate 30-day IV
+        hist['returns'] = hist['Close'].pct_change()
+        volatility = hist['returns'].tail(30).std() * np.sqrt(252)
+        
+        # Get recent news sentiment (simple version)
+        try:
+            news = yf_ticker.news[:3] if hasattr(yf_ticker, 'news') else []
+            news_count = len(news)
+        except:
+            news_count = 0
+        
+        # Calculate price momentum
+        price_change_30d = ((current_price - hist['Close'].iloc[-30]) / hist['Close'].iloc[-30]) * 100
+        
+        # Check if options are available
+        try:
+            options_dates = yf_ticker.options
+            has_options = len(options_dates) > 0
+        except:
+            has_options = False
+        
+        if not has_options:
+            return None
+        
+        # Volume analysis
+        avg_volume = info.get('averageVolume', 0)
+        
+        # Determine IV rank (simplified)
+        hist['volatility_60d'] = hist['returns'].rolling(60).std() * np.sqrt(252)
+        iv_percentile = (volatility / hist['volatility_60d'].max()) * 100 if hist['volatility_60d'].max() > 0 else 50
+        
+        # Score the stock for iron condor suitability (0-100)
+        score = 0
+        
+        # High IV is good for iron condors (selling premium)
+        if 0.20 <= volatility <= 0.50:
+            score += 30
+        elif 0.15 <= volatility < 0.20 or 0.50 < volatility <= 0.60:
+            score += 20
+        else:
+            score += 10
+        
+        # Moderate price movement is ideal
+        if abs(price_change_30d) < 5:
+            score += 25
+        elif abs(price_change_30d) < 10:
+            score += 15
+        else:
+            score += 5
+        
+        # High volume is important
+        if avg_volume > 5000000:
+            score += 20
+        elif avg_volume > 1000000:
+            score += 15
+        else:
+            score += 5
+        
+        # News activity (moderate is good)
+        if news_count >= 2:
+            score += 15
+        elif news_count >= 1:
+            score += 10
+        else:
+            score += 5
+        
+        # High IV rank is ideal
+        if iv_percentile > 70:
+            score += 10
+        elif iv_percentile > 50:
+            score += 5
+        
+        # Generate recommendation
+        if score >= 70:
+            recommendation = "Strong Buy"
+            badge_class = "badge-buy"
+        elif score >= 50:
+            recommendation = "Consider"
+            badge_class = "badge-watch"
+        else:
+            recommendation = "Monitor"
+            badge_class = "badge-caution"
+        
+        return {
+            'symbol': symbol,
+            'price': current_price,
+            'iv': volatility,
+            'iv_percentile': iv_percentile,
+            'price_change_30d': price_change_30d,
+            'volume': avg_volume,
+            'news_count': news_count,
+            'score': score,
+            'recommendation': recommendation,
+            'badge_class': badge_class,
+            'category': price_range_category
+        }
+    except Exception as e:
+        return None
+
+def scan_stocks_by_price_range(price_range_key, top_n=3):
+    """Scan stocks in a price range and return top candidates"""
+    stocks = STOCK_UNIVERSE.get(price_range_key, [])
+    results = []
+    
+    with st.spinner(f"Analyzing {len(stocks)} stocks..."):
+        for symbol in stocks:
+            analysis = analyze_stock_for_iron_condor(symbol, price_range_key)
+            if analysis:
+                results.append(analysis)
+    
+    # Sort by score
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:top_n]
+
+def display_stock_suggestion(analysis):
+    """Display a stock suggestion card"""
+    
+    # Determine heat level for styling
+    if analysis['iv'] > 0.40:
+        heat_class = "suggestion-hot"
+        heat_emoji = "🔥"
+        heat_text = "HIGH VOLATILITY"
+    elif analysis['iv'] > 0.25:
+        heat_class = "suggestion-moderate"
+        heat_emoji = "📊"
+        heat_text = "MODERATE VOLATILITY"
+    else:
+        heat_class = "suggestion-cool"
+        heat_emoji = "❄️"
+        heat_text = "LOW VOLATILITY"
+    
+    st.markdown(f"""
+    <div class='suggestion-card {heat_class}'>
+        <div class='stock-header'>
+            {heat_emoji} ${analysis['symbol']} - ${analysis['price']:.2f}
+            <span class='recommendation-badge {analysis['badge_class']}'>{analysis['recommendation']}</span>
+        </div>
+        
+        <div style='color: #ffd700; font-size: 1.1em; margin: 10px 0;'>
+            {heat_text} | IV: {analysis['iv']*100:.1f}% (Rank: {analysis['iv_percentile']:.0f}th percentile)
+        </div>
+        
+        <div class='stock-metrics'>
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>30-Day Move</div>
+                <div style='color: {"#2ed573" if abs(analysis["price_change_30d"]) < 5 else "#ffa502" if abs(analysis["price_change_30d"]) < 10 else "#ff4757"}; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['price_change_30d']:+.2f}%
+                </div>
+            </div>
+            
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>Avg Volume</div>
+                <div style='color: white; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['volume']/1000000:.1f}M
+                </div>
+            </div>
+            
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>Suitability Score</div>
+                <div style='color: {"#2ed573" if analysis["score"] >= 70 else "#ffa502" if analysis["score"] >= 50 else "#ff4757"}; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['score']}/100
+                </div>
+            </div>
+            
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>Recent News</div>
+                <div style='color: white; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['news_count']} articles
+                </div>
+            </div>
+        </div>
+        
+        <div style='margin-top: 15px; padding: 12px; background: rgba(0,0,0,0.3); border-radius: 8px;'>
+            <strong style='color: #00d4ff;'>💡 Why This Stock?</strong><br>
+            <span style='font-size: 0.95em;'>
+                {'• High IV = More premium to collect<br>' if analysis['iv'] > 0.30 else ''}
+                {'• Stable price action = Lower risk<br>' if abs(analysis['price_change_30d']) < 5 else ''}
+                {'• High volume = Easy to enter/exit<br>' if analysis['volume'] > 5000000 else ''}
+                {'• Recent news activity = Volatility opportunities<br>' if analysis['news_count'] >= 2 else ''}
+                • Options available with multiple expirations
+            </span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
     try:
@@ -838,7 +1034,7 @@ if symbol:
             """, unsafe_allow_html=True)
 
         # Main tabs
-        tab1, tab2, tab3 = st.tabs(["🎯 Strategy Builder", "📈 Technical Chart", "📰 Market News"])
+        tab1, tab2, tab3, tab4 = st.tabs(["🎯 Strategy Builder", "🔍 Stock Screener", "📈 Technical Chart", "📰 Market News"])
 
         with tab1:
             st.markdown("### Generate Iron Condor Strategies")
@@ -878,6 +1074,118 @@ if symbol:
                 st.info("👆 Click the button above to generate iron condor strategies with live market prices")
 
         with tab2:
+            st.markdown("### 🔍 AI-Powered Stock Screener")
+            st.markdown("""
+            <div class='alert-box alert-info'>
+                <strong>🎯 What We're Looking For:</strong><br>
+                • <strong>Moderate to High IV</strong> - More premium to collect<br>
+                • <strong>Stable Price Action</strong> - Less directional risk<br>
+                • <strong>High Liquidity</strong> - Easy entry and exit<br>
+                • <strong>Active Options Market</strong> - Multiple expirations available<br>
+                • <strong>Recent News</strong> - Volatility catalysts without extreme moves
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Market overview
+            market_data = get_market_overview()
+            if market_data:
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown(f"""
+                    <div class='metric-box'>
+                        <div class='metric-label'>📊 SPY Price</div>
+                        <div class='metric-value'>${market_data['spy_price']:.2f}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with col2:
+                    st.markdown(f"""
+                    <div class='metric-box'>
+                        <div class='metric-label'>📈 5-Day Change</div>
+                        <div class='metric-value' style='color: {"#2ed573" if market_data["spy_change"] >= 0 else "#ff4757"}'>{market_data['spy_change']:+.2f}%</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with col3:
+                    st.markdown(f"""
+                    <div class='metric-box'>
+                        <div class='metric-label'>🔥 VIX Level</div>
+                        <div class='metric-value'>{market_data['vix_level']:.2f}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Stock suggestions by price range
+            if st.button("🔎 SCAN FOR OPPORTUNITIES", use_container_width=True, type="primary"):
+                
+                price_tabs = st.tabs(["💰 Under $50", "💵 $50-$100", "💎 $100-$500", "🏆 Premium ETFs"])
+                
+                with price_tabs[0]:
+                    st.markdown("### Budget-Friendly Opportunities (Under $50)")
+                    st.markdown("""
+                    <div class='alert-box alert-success'>
+                        <strong>✅ Advantages:</strong> Lower capital requirement, easier to deploy multiple contracts<br>
+                        <strong>⚠️ Considerations:</strong> May have wider bid-ask spreads, ensure sufficient liquidity
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    suggestions = scan_stocks_by_price_range("under_50", top_n=5)
+                    if suggestions:
+                        for analysis in suggestions:
+                            display_stock_suggestion(analysis)
+                    else:
+                        st.warning("No suitable candidates found in this price range at the moment.")
+                
+                with price_tabs[1]:
+                    st.markdown("### Mid-Range Opportunities ($50-$100)")
+                    st.markdown("""
+                    <div class='alert-box alert-success'>
+                        <strong>✅ Advantages:</strong> Good liquidity, balanced premium collection<br>
+                        <strong>⚠️ Considerations:</strong> Sweet spot for many retail traders
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    suggestions = scan_stocks_by_price_range("under_100", top_n=5)
+                    if suggestions:
+                        for analysis in suggestions:
+                            display_stock_suggestion(analysis)
+                    else:
+                        st.warning("No suitable candidates found in this price range at the moment.")
+                
+                with price_tabs[2]:
+                    st.markdown("### High-Value Opportunities ($100-$500)")
+                    st.markdown("""
+                    <div class='alert-box alert-success'>
+                        <strong>✅ Advantages:</strong> Premium stocks, excellent liquidity, substantial premiums<br>
+                        <strong>⚠️ Considerations:</strong> Higher capital requirement, larger potential losses
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    suggestions = scan_stocks_by_price_range("under_500", top_n=5)
+                    if suggestions:
+                        for analysis in suggestions:
+                            display_stock_suggestion(analysis)
+                    else:
+                        st.warning("No suitable candidates found in this price range at the moment.")
+                
+                with price_tabs[3]:
+                    st.markdown("### Premium ETF Opportunities")
+                    st.markdown("""
+                    <div class='alert-box alert-info'>
+                        <strong>🏆 Best For:</strong> Consistent premium, lower single-stock risk, diversified exposure<br>
+                        <strong>📊 Ideal For:</strong> Conservative iron condor traders seeking steady income
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    suggestions = scan_stocks_by_price_range("premium", top_n=4)
+                    if suggestions:
+                        for analysis in suggestions:
+                            display_stock_suggestion(analysis)
+                    else:
+                        st.warning("No suitable ETF candidates found at the moment.")
+            else:
+                st.info("👆 Click to scan the market for the best iron condor opportunities across all price ranges")
+
+        with tab3:
             st.markdown("### Technical Analysis")
             fig = make_subplots(
                 rows=2, cols=1, 
