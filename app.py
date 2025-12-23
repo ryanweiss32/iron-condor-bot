@@ -21,9 +21,11 @@ st.set_page_config(page_title="Iron Condor Master", layout="wide", page_icon="�
 st.markdown("""
 <style>
     .metric-container { background-color: #1e1e1e; border: 1px solid #333; border-radius: 10px; padding: 15px; text-align: center; }
-    .trade-box { background-color: #262730; padding: 20px; border-radius: 10px; border-left: 5px solid #2196F3; }
-    .live-data { color: #00E676; font-weight: bold; font-family: monospace; }
-    .est-data { color: #FFB74D; font-weight: bold; font-family: monospace; }
+    .trade-card { background-color: #262730; padding: 20px; border-radius: 10px; margin-bottom: 15px; }
+    .call-side { border-left: 5px solid #FF5252; }
+    .put-side { border-left: 5px solid #00E676; }
+    .profit { color: #00E676; font-weight: bold; }
+    .loss { color: #FF5252; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,13 +44,36 @@ with st.sidebar:
     days_back = st.slider("Analysis Window (Days)", 100, 500, 365)
     
     st.divider()
-    st.subheader("⚙️ Trade Settings")
-    wing_width = st.slider("Wing Width ($)", 1, 10, 5)
+    st.subheader("⚙️ Global Settings")
+    wing_width = st.slider("Wing Width ($)", 1, 10, 5, help="Width of the protection wings.")
     target_iv = st.number_input("Implied Volatility (Est.)", 0.1, 1.0, 0.15, step=0.01)
 
 # --- 4. HELPER FUNCTIONS ---
+def get_next_trading_day(days_offset):
+    """Calculates target date skipping weekends."""
+    target = date.today()
+    added = 0
+    while added < days_offset:
+        target += timedelta(days=1)
+        # 5 = Saturday, 6 = Sunday
+        if target.weekday() < 5:
+            added += 1
+    return target
+
 def round_to_strike(price, interval=1.0):
     return round(price / interval) * interval
+
+def normal_cdf(x):
+    return (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+
+def calculate_probability(price, upper, lower, iv, days):
+    t = days / 365.0
+    vol = iv * math.sqrt(t)
+    if vol == 0: return 0
+    z_upper = math.log(upper / price) / vol
+    z_lower = math.log(lower / price) / vol
+    prob = normal_cdf(z_upper) - normal_cdf(z_lower)
+    return prob * 100
 
 def get_stock_data(sym):
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
@@ -97,175 +122,151 @@ def get_live_quotes(option_symbols):
         return {}
 
 def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_credit):
-    # Determine plot range
     min_price = long_put - (wing_width * 1.5)
     max_price = long_call + (wing_width * 1.5)
     prices = np.linspace(min_price, max_price, 100)
-    
     profits = []
     for price in prices:
-        # 1. Put Wing Payoff
         p_long_put = max(long_put - price, 0)
         p_short_put = -max(short_put - price, 0)
-        
-        # 2. Call Wing Payoff
         p_short_call = -max(price - short_call, 0)
         p_long_call = max(price - long_call, 0)
-        
-        # Total Payoff (plus credit received)
         total = (p_long_put + p_short_put + p_short_call + p_long_call) * 100 + (net_credit * 100)
         profits.append(total)
         
     fig = go.Figure()
-    
-    # The Payoff Line
-    fig.add_trace(go.Scatter(x=prices, y=profits, mode='lines', name='P/L at Expiry', 
-                             line=dict(color='#00E676', width=3)))
-    
-    # Zero Line (Breakeven)
+    fig.add_trace(go.Scatter(x=prices, y=profits, mode='lines', name='P/L Line', line=dict(color='#00E676', width=3)))
     fig.add_hline(y=0, line_dash="dash", line_color="gray")
-    
-    # Current Price Marker
-    fig.add_vline(x=current_price, line_dash="dot", line_color="yellow", annotation_text="Current Price")
-    
-    # Styling
-    fig.update_layout(
-        title="Strategy Payoff Diagram (At Expiration)",
-        xaxis_title="Stock Price",
-        yaxis_title="Profit / Loss ($)",
-        template="plotly_dark",
-        height=400
-    )
-    
-    # Add Shading
-    fig.add_hrect(y0=0, y1=max(profits), fillcolor="green", opacity=0.1, line_width=0)
-    fig.add_hrect(y0=min(profits), y1=0, fillcolor="red", opacity=0.1, line_width=0)
-    
+    fig.add_vline(x=current_price, line_dash="dot", line_color="yellow", annotation_text="Price")
+    fig.update_layout(title="Profit/Loss Diagram", template="plotly_dark", height=300, margin=dict(l=10, r=10, t=30, b=10))
     return fig
 
-# --- 5. MAIN DASHBOARD ---
-st.title(f"🦅 {symbol} Strategy Center")
+# --- 5. LOGIC ENGINE FOR SCENARIOS ---
+def generate_scenario_card(trading_client, symbol, current_price, days_offset, scenario_name):
+    """Calculates and renders a single timeframe scenario."""
+    
+    # 1. Date Logic
+    expiry = get_next_trading_day(days_offset)
+    days_to_expiry = (expiry - date.today()).days
+    
+    # 2. Strike Logic (Expected Move)
+    # Shorter time = Smaller Move = Tighter Spreads
+    move = current_price * target_iv * math.sqrt(days_to_expiry/365.0)
+    
+    s_call = round_to_strike(current_price + move, 1.0)
+    l_call = s_call + wing_width
+    s_put = round_to_strike(current_price - move, 1.0)
+    l_put = s_put - wing_width
+    
+    # 3. Fetch Contracts
+    legs = [
+        (s_call, ContractType.CALL, "SELL"),
+        (l_call, ContractType.CALL, "BUY"),
+        (s_put, ContractType.PUT, "SELL"),
+        (l_put, ContractType.PUT, "BUY")
+    ]
+    
+    symbols = []
+    found_contracts = []
+    
+    for strike, ctype, side in legs:
+        c = find_contract(trading_client, symbol, strike, ctype, expiry)
+        if c: 
+            found_contracts.append(c)
+            symbols.append(c.symbol)
+            
+    # 4. Render UI
+    st.markdown(f"### {scenario_name} (Expires: {expiry})")
+    
+    if len(found_contracts) == 4:
+        quotes = get_live_quotes(symbols)
+        prices = []
+        total_credit = 0.0
+        
+        for i, c in enumerate(found_contracts):
+            side = legs[i][2]
+            if c.symbol in quotes:
+                q = quotes[c.symbol].latest_quote
+                p = (q.ask_price + q.bid_price) / 2
+            else:
+                # Estimate
+                dist = abs(current_price - legs[i][0])
+                p = max(0.05, 5.0 - (dist * 0.1)) if dist < 20 else 0.05
+            
+            prices.append(p)
+            if side == "SELL": total_credit += p
+            else: total_credit -= p
+            
+        max_profit = total_credit * 100
+        max_loss = (wing_width * 100) - max_profit
+        pop = calculate_probability(current_price, s_call, s_put, target_iv, days_to_expiry)
+        
+        # Metrics
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Max Profit", f"${max_profit:.0f}")
+        c2.metric("Max Loss", f"${max_loss:.0f}")
+        c3.metric("Win Prob", f"{pop:.1f}%")
+        
+        # Cards
+        col_call, col_put = st.columns(2)
+        with col_call:
+            st.markdown(f"""<div class='trade-card call-side'>
+            <strong style='color:#FF5252'>Bear Call Side</strong><br>
+            Sell ${s_call} Call<br>Buy ${l_call} Call
+            </div>""", unsafe_allow_html=True)
+        with col_put:
+            st.markdown(f"""<div class='trade-card put-side'>
+            <strong style='color:#00E676'>Bull Put Side</strong><br>
+            Sell ${s_put} Put<br>Buy ${l_put} Put
+            </div>""", unsafe_allow_html=True)
+            
+        with st.expander("See Graph"):
+             st.plotly_chart(plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), use_container_width=True)
+             
+    else:
+        st.warning(f"Market data unavailable for {expiry}. (Exchanges might be closed or contracts don't exist yet).")
+
+
+# --- 6. MAIN DASHBOARD ---
+st.title(f"🦅 {symbol} Multi-Timeframe Analyzer")
 
 if symbol:
     try:
         df = get_stock_data(symbol)
         current_price = df.iloc[-1]['close']
         
-        # Technicals
+        # Technicals for Chart
         df['SMA_50'] = df['close'].rolling(50).mean()
         df['Upper_Band'] = df['SMA_50'] + (df['close'].rolling(20).std() * 2)
         df['Lower_Band'] = df['SMA_50'] - (df['close'].rolling(20).std() * 2)
         df['RSI'] = 100 - (100 / (1 + (df['close'].diff().where(lambda x: x > 0, 0).rolling(14).mean() / df['close'].diff().where(lambda x: x < 0, 0).abs().rolling(14).mean())))
 
-        # --- SCENARIO GENERATION ---
-        days_to_expiry = 7
-        base_move = current_price * target_iv * math.sqrt(days_to_expiry/365)
-        
-        short_call_strike = round_to_strike(current_price + base_move, 1.0)
-        long_call_strike = short_call_strike + wing_width
-        short_put_strike = round_to_strike(current_price - base_move, 1.0)
-        long_put_strike = short_put_strike - wing_width
-
         # --- TABS ---
-        tab1, tab2, tab3 = st.tabs(["📊 Trade Builder", "📉 Analysis", "📰 News"])
+        tab1, tab2, tab3 = st.tabs(["📊 Trade Builder", "📉 Chart", "📰 News"])
 
         with tab1:
-            st.subheader(f"Strategy: Iron Condor ({days_to_expiry} DTE)")
+            st.write(f"Current Price: **${current_price:.2f}** | Generating 3 distinct strategies...")
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Current Price", f"${current_price:.2f}")
-            c2.metric("Call Spread", f"${short_call_strike} / ${long_call_strike}")
-            c3.metric("Put Spread", f"${short_put_strike} / ${long_put_strike}")
-            
-            st.divider()
-            
-            if st.button("🔴 Build Trade & Visualize"):
+            if st.button("🔴 GENERATE ALL SCENARIOS"):
                 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
                 
-                # Dynamic Expiry
-                today = date.today()
-                days_ahead = 4 - today.weekday()
-                if days_ahead <= 0: days_ahead += 7
-                expiry = today + timedelta(days=days_ahead)
+                # We use Tabs within the result area for cleaner look
+                t1, t2, t3 = st.tabs(["1 Day (Gamma Scalp)", "2 Days (Swing)", "7 Days (Standard)"])
                 
-                with st.spinner(f"Scanning chain for {expiry}..."):
-                    legs = []
-                    # Exact 4-Leg Order Definition:
-                    # 1. Sell OTM Put
-                    # 2. Buy Further OTM Put
-                    # 3. Sell OTM Call
-                    # 4. Buy Further OTM Call
-                    leg_configs = [
-                        (short_call_strike, ContractType.CALL, "SELL"),
-                        (long_call_strike, ContractType.CALL, "BUY"),
-                        (short_put_strike, ContractType.PUT, "SELL"),
-                        (long_put_strike, ContractType.PUT, "BUY")
-                    ]
-                    
-                    found_all = True
-                    trade_rows = []
-                    total_credit = 0.0
-                    is_live = True
-                    symbols = []
-                    
-                    # 1. Find Contracts
-                    for strike, ctype, side in leg_configs:
-                        c = find_contract(trading_client, symbol, strike, ctype, expiry)
-                        if c:
-                            legs.append(c)
-                            symbols.append(c.symbol)
-                        else:
-                            found_all = False
-                    
-                    # 2. Get Data
-                    if found_all:
-                        quotes = get_live_quotes(symbols)
-                        if not quotes: is_live = False
+                with t1:
+                    with st.spinner("Analyzing 1-Day Options..."):
+                        generate_scenario_card(trading_client, symbol, current_price, 1, "1-Day Expiry")
+                
+                with t2:
+                    with st.spinner("Analyzing 2-Day Options..."):
+                        generate_scenario_card(trading_client, symbol, current_price, 2, "2-Day Expiry")
                         
-                        for i, contract in enumerate(legs):
-                            side = leg_configs[i][2]
-                            strike = leg_configs[i][0]
-                            
-                            if is_live and contract.symbol in quotes:
-                                q = quotes[contract.symbol].latest_quote
-                                price = (q.ask_price + q.bid_price) / 2
-                                src = "LIVE"
-                            else:
-                                # Estimate for fallback
-                                dist = abs(current_price - strike)
-                                price = max(0.1, 5.0 - (dist * 0.15)) if dist < 15 else 0.05
-                                src = "EST"
-                            
-                            if side == "SELL": total_credit += price
-                            else: total_credit -= price
-                            
-                            trade_rows.append({
-                                "Leg": f"{side} {contract.type.value}",
-                                "Strike": f"${strike}",
-                                "Price": f"${price:.2f}",
-                                "Source": src
-                            })
-                            
-                        # 3. Visuals
-                        c_left, c_right = st.columns([1, 1])
-                        
-                        with c_left:
-                            st.table(pd.DataFrame(trade_rows))
-                            st.markdown(f"""
-                            <div class='trade-box'>
-                            <p><b>Net Credit:</b> ${total_credit*100:.0f}</p>
-                            <p><b>Max Risk:</b> ${(wing_width - total_credit)*100:.0f}</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                            
-                        with c_right:
-                            fig_payoff = plot_payoff(current_price, short_call_strike, long_call_strike, short_put_strike, long_put_strike, total_credit)
-                            st.plotly_chart(fig_payoff, use_container_width=True)
-                            
-                    else:
-                        st.error("Could not find all 4 legs. Market might be closed.")
+                with t3:
+                    with st.spinner("Analyzing Weekly Options..."):
+                        generate_scenario_card(trading_client, symbol, current_price, 7, "7-Day Expiry")
+
             else:
-                st.info("Click the button to scan the option chain.")
+                st.info("Click the button to fetch live data for all timeframes.")
 
         with tab2:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
