@@ -216,10 +216,15 @@ with st.sidebar:
     
     st.divider()
     st.markdown("### ⚙️ Strategy Parameters")
-    wing_width = st.slider("🔧 Wing Width ($)", 1, 10, 5, 
+    wing_width = st.slider("🔧 Wing Width ($)", 3, 15, 5, 
                           help="Distance between short and long strikes. Wider wings = lower risk but lower profit.")
-    target_iv = st.number_input("📉 Implied Volatility (Est.)", 0.1, 1.0, 0.15, step=0.01,
+    target_iv = st.number_input("📉 Implied Volatility (Est.)", 0.1, 1.0, 0.20, step=0.01,
                                help="Expected volatility. Higher IV = wider spreads needed.")
+    
+    st.divider()
+    st.markdown("### 🎯 Strike Selection")
+    strike_stdev = st.slider("Standard Deviations", 0.5, 2.0, 1.0, step=0.1,
+                            help="How far from current price to place short strikes. Higher = safer but less premium.")
     
     st.divider()
     st.markdown("### 📚 Quick Guide")
@@ -397,11 +402,25 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     days_to_expiry = (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
     if days_to_expiry < 1: days_to_expiry = 1
     
-    # Calculate strikes
-    move = current_price * target_iv * math.sqrt(days_to_expiry/365.0)
-    s_call = round_to_strike(current_price + move, 1.0)
+    # Calculate strikes using standard deviations for better placement
+    # Use adjustable multiplier based on timeframe
+    if days_offset <= 3:
+        stdev_mult = strike_stdev * 0.7  # Tighter for very short term
+    elif days_offset <= 7:
+        stdev_mult = strike_stdev * 0.85  # Slightly tighter
+    elif days_offset <= 15:
+        stdev_mult = strike_stdev * 1.0  # Standard
+    else:
+        stdev_mult = strike_stdev * 1.15  # Wider for longer term
+    
+    move = current_price * target_iv * math.sqrt(days_to_expiry/365.0) * stdev_mult
+    
+    # Round to nearest $1 or $0.50 depending on stock price
+    strike_interval = 1.0 if current_price > 100 else 0.50
+    
+    s_call = round_to_strike(current_price + move, strike_interval)
     l_call = s_call + wing_width
-    s_put = round_to_strike(current_price - move, 1.0)
+    s_put = round_to_strike(current_price - move, strike_interval)
     l_put = s_put - wing_width
     
     st.markdown(f"<div class='strategy-header'>🎯 {scenario_name}</div>", unsafe_allow_html=True)
@@ -421,21 +440,38 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     for strike, otype, side, _ in legs:
         price, actual_strike = get_option_price_yf(yf_ticker, expiry_str, strike, otype)
         prices.append(price)
-        if side == "SELL": total_credit += price
-        else: total_credit -= price
+        if side == "SELL": 
+            total_credit += price
+        else: 
+            total_credit -= price
     
-    # Calculate metrics
+    # Ensure we have a net credit (if not, adjust strategy explanation)
+    if total_credit <= 0:
+        st.warning("⚠️ This combination results in a net debit. Consider adjusting wing width or IV estimate.")
+        return
+    
+    # Calculate metrics with improved formulas
     max_profit = total_credit * 100
     max_loss = (wing_width * 100) - max_profit
+    
+    # Ensure positive max_loss for display
+    if max_loss <= 0:
+        max_loss = wing_width * 100 * 0.5  # Estimate if calculation is off
+    
     pop = calculate_probability(current_price, s_call, s_put, target_iv, days_to_expiry)
-    risk_reward = abs(max_profit / max_loss) if max_loss != 0 else 0
+    
+    # Risk/Reward ratio (profit:loss)
+    risk_reward = max_profit / max_loss if max_loss > 0 else 0
+    
+    # Return on Risk (%)
+    return_on_risk = (max_profit / max_loss * 100) if max_loss > 0 else 0
     
     # Display strategy visual
     st.markdown(create_strategy_visual(current_price, s_call, l_call, s_put, l_put), unsafe_allow_html=True)
     
     # Metrics row
     st.markdown("<div class='metric-row'>", unsafe_allow_html=True)
-    cols = st.columns(4)
+    cols = st.columns(5)
     
     with cols[0]:
         st.markdown(f"""
@@ -456,16 +492,24 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     with cols[2]:
         st.markdown(f"""
         <div class='metric-box'>
-            <div class='metric-label'>🎲 Win Probability</div>
-            <div class='metric-value'>{pop:.1f}%</div>
+            <div class='metric-label'>⚖️ Risk/Reward</div>
+            <div class='metric-value'>1:{risk_reward:.2f}</div>
         </div>
         """, unsafe_allow_html=True)
     
     with cols[3]:
         st.markdown(f"""
         <div class='metric-box'>
-            <div class='metric-label'>⚖️ Risk/Reward</div>
-            <div class='metric-value'>1:{risk_reward:.2f}</div>
+            <div class='metric-label'>📈 Return on Risk</div>
+            <div class='metric-value'>{return_on_risk:.1f}%</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with cols[4]:
+        st.markdown(f"""
+        <div class='metric-box'>
+            <div class='metric-label'>🎲 Win Probability</div>
+            <div class='metric-value'>{pop:.1f}%</div>
         </div>
         """, unsafe_allow_html=True)
     
@@ -634,24 +678,38 @@ if symbol:
 
         with tab1:
             st.markdown("### Generate Iron Condor Strategies")
+            st.markdown("""
+            <div class='alert-box alert-info'>
+                <strong>💡 Recommended Timeframes:</strong><br>
+                • <strong>3 Days:</strong> Quick scalp - High theta decay, needs tight management<br>
+                • <strong>7 Days:</strong> Short-term income - Good balance of premium and time<br>
+                • <strong>15 Days:</strong> Standard trade - Ideal risk/reward balance<br>
+                • <strong>30 Days:</strong> Monthly income - Maximum premium collection
+            </div>
+            """, unsafe_allow_html=True)
             
             if st.button("🚀 GENERATE ALL TIMEFRAMES", use_container_width=True):
-                t1, t2, t3 = st.tabs(["⚡ 1-Day (Gamma Scalp)", "📊 2-Day (Swing Trade)", "📅 7-Day (Standard)"])
+                t1, t2, t3, t4 = st.tabs(["⚡ 3-Day", "📊 7-Day", "📅 15-Day", "📆 30-Day"])
                 
                 with t1:
-                    st.markdown("<div class='alert-box alert-warning'>⚡ Ultra-short timeframe - High risk, high theta decay</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='alert-box alert-warning'>⚡ Ultra-short timeframe - Rapid theta decay, tight strikes</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
-                        generate_scenario_card(symbol, current_price, 1, "1-Day Expiry")
+                        generate_scenario_card(symbol, current_price, 3, "3-Day Expiry")
                 
                 with t2:
-                    st.markdown("<div class='alert-box alert-warning'>📊 Short-term trade - Quick profits or losses</div>", unsafe_allow_html=True)
-                    with st.spinner("Fetching market data..."):
-                        generate_scenario_card(symbol, current_price, 2, "2-Day Expiry")
-                
-                with t3:
-                    st.markdown("<div class='alert-box alert-success'>📅 Ideal timeframe - Balance of premium and time</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='alert-box alert-success'>📊 Short-term optimal - Sweet spot for many traders</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
                         generate_scenario_card(symbol, current_price, 7, "7-Day Expiry")
+                
+                with t3:
+                    st.markdown("<div class='alert-box alert-success'>📅 Standard iron condor - Best risk/reward ratio</div>", unsafe_allow_html=True)
+                    with st.spinner("Fetching market data..."):
+                        generate_scenario_card(symbol, current_price, 15, "15-Day Expiry")
+                
+                with t4:
+                    st.markdown("<div class='alert-box alert-info'>📆 Monthly strategy - Maximum premium with more breathing room</div>", unsafe_allow_html=True)
+                    with st.spinner("Fetching market data..."):
+                        generate_scenario_card(symbol, current_price, 30, "30-Day Expiry")
             else:
                 st.info("👆 Click the button above to generate iron condor strategies with live market prices")
 
