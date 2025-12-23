@@ -13,11 +13,36 @@ st.set_page_config(page_title="Iron Condor Strategy Builder", layout="wide", pag
 # --- LOAD SECRETS (MASSIVE / POLYGON) ---
 try:
     MASSIVE_API_KEY = st.secrets["MASSIVE_API_KEY"]
+    st.sidebar.success(f"✅ API Key Loaded: {MASSIVE_API_KEY[:8]}...")
 except:
     st.error("❌ Critical Error: Could not find MASSIVE_API_KEY in secrets.")
     st.stop()
 
 MASSIVE_BASE_URL = "https://api.polygon.io"
+
+# Test API connection
+def test_api_connection():
+    """Test if API key is valid"""
+    url = f"{MASSIVE_BASE_URL}/v2/aggs/ticker/SPY/prev"
+    params = {"apiKey": MASSIVE_API_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        st.sidebar.info(f"API Status Code: {resp.status_code}")
+        if resp.status_code == 200:
+            st.sidebar.success("✅ API Connection Working!")
+            return True
+        elif resp.status_code == 401:
+            st.sidebar.error("❌ Invalid API Key")
+            return False
+        elif resp.status_code == 403:
+            st.sidebar.error("❌ API Key doesn't have required permissions")
+            return False
+        else:
+            st.sidebar.warning(f"⚠️ Unexpected response: {resp.status_code}")
+            return False
+    except Exception as e:
+        st.sidebar.error(f"❌ Connection Error: {str(e)}")
+        return False
 
 # Popular stocks by price range for screening
 STOCK_UNIVERSE = {
@@ -262,6 +287,12 @@ st.markdown("""
 # --- SIDEBAR ---
 with st.sidebar:
     st.markdown("### 🦅 Strategy Control Panel")
+    
+    # Test API Connection
+    with st.expander("🔌 Test API Connection", expanded=True):
+        if st.button("Test Polygon API"):
+            test_api_connection()
+    
     symbol = st.text_input("📈 Ticker Symbol", value="SPY").upper()
     days_back = st.slider("📊 Analysis Window (Days)", 100, 500, 365)
     
@@ -418,15 +449,48 @@ def get_stock_data_polygon(sym, lookback_days):
     params = {"apiKey": MASSIVE_API_KEY, "limit": 50000}
     
     try:
-        resp = requests.get(url, params=params).json()
-        if resp.get("results"):
-            df = pd.DataFrame(resp["results"])
+        resp = requests.get(url, params=params, timeout=10)
+        
+        # Debug info
+        st.sidebar.info(f"📊 Stock Data Status: {resp.status_code}")
+        
+        if resp.status_code == 401:
+            st.error("❌ Invalid API Key - Check your Polygon/Massive API key")
+            return pd.DataFrame()
+        elif resp.status_code == 403:
+            st.error("❌ Access Denied - Your API plan may not include this data")
+            return pd.DataFrame()
+        elif resp.status_code == 404:
+            st.error(f"❌ Ticker '{sym}' not found")
+            return pd.DataFrame()
+        elif resp.status_code != 200:
+            st.error(f"❌ API Error: Status {resp.status_code}")
+            st.code(resp.text)
+            return pd.DataFrame()
+        
+        data = resp.json()
+        
+        if data.get("status") == "ERROR":
+            st.error(f"❌ API Error: {data.get('error', 'Unknown error')}")
+            st.code(str(data))
+            return pd.DataFrame()
+        
+        if data.get("results"):
+            df = pd.DataFrame(data["results"])
             df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
             # Polygon returns: o, h, l, c, v. Rename to standard.
             df = df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
+            st.sidebar.success(f"✅ Loaded {len(df)} bars")
             return df
+        else:
+            st.error(f"❌ No data returned for {sym}")
+            st.code(str(data))
+            return pd.DataFrame()
+    except requests.exceptions.Timeout:
+        st.error("❌ Request timed out - Try again")
         return pd.DataFrame()
-    except:
+    except Exception as e:
+        st.error(f"❌ Unexpected error: {str(e)}")
         return pd.DataFrame()
 
 def get_current_price_polygon(sym):
