@@ -2,3 +2,4 @@ streamlit
 alpaca-py
 pandas
 plotly
+yfinance
