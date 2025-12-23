@@ -216,10 +216,18 @@ with st.sidebar:
     
     st.divider()
     st.markdown("### ⚙️ Strategy Parameters")
-    wing_width = st.slider("🔧 Wing Width ($)", 3, 15, 5, 
-                          help="Distance between short and long strikes. Wider wings = lower risk but lower profit.")
-    target_iv = st.number_input("📉 Implied Volatility (Est.)", 0.1, 1.0, 0.20, step=0.01,
-                               help="Expected volatility. Higher IV = wider spreads needed.")
+    
+    strategy_profile = st.radio("🎯 Strategy Profile", 
+                                ["Show All 3", "Aggressive Only", "Balanced Only", "Conservative Only"],
+                                help="Choose which risk profiles to display")
+    
+    iv_mode = st.radio("IV Calculation Method", 
+                      ["Auto (Historical)", "Manual Override"],
+                      help="Auto calculates IV from recent price action. Manual lets you set your own.")
+    
+    if iv_mode == "Manual Override":
+        target_iv = st.number_input("📉 Implied Volatility", 0.1, 1.0, 0.20, step=0.01,
+                                   help="Expected volatility. Higher IV = wider spreads needed.")
     
     st.divider()
     st.markdown("### 🎯 Strike Selection")
@@ -267,6 +275,22 @@ def calculate_probability(price, upper, lower, iv, days):
     prob = normal_cdf(z_upper) - normal_cdf(z_lower)
     return prob * 100
 
+def calculate_historical_volatility(df, window=30):
+    """Calculate annualized historical volatility from price data"""
+    if len(df) < window:
+        window = len(df)
+    
+    # Calculate daily returns
+    df['returns'] = df['close'].pct_change()
+    
+    # Calculate standard deviation of returns
+    volatility = df['returns'].tail(window).std()
+    
+    # Annualize (252 trading days per year)
+    annual_volatility = volatility * np.sqrt(252)
+    
+    return annual_volatility
+
 def get_stock_data(sym):
     stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
     req = StockBarsRequest(
@@ -306,8 +330,11 @@ def get_closest_expiry_yf(ticker_obj, target_date):
     return closest.strftime("%Y-%m-%d")
 
 def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_credit):
-    min_price = long_put - (wing_width * 1.5)
-    max_price = long_call + (wing_width * 1.5)
+    # Use a default wing_width for plotting if not available globally
+    plot_wing_width = abs(long_call - short_call)
+    
+    min_price = long_put - (plot_wing_width * 1.5)
+    max_price = long_call + (plot_wing_width * 1.5)
     prices = np.linspace(min_price, max_price, 100)
     profits = []
     
@@ -389,7 +416,41 @@ def create_strategy_visual(current_price, short_call, long_call, short_put, long
     </div>
     """
 
-def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
+def calculate_optimal_wing_widths(current_price, calculated_iv, days_to_expiry):
+    """
+    Calculate three optimal wing widths based on different risk profiles
+    Returns: (aggressive_width, balanced_width, conservative_width)
+    """
+    # Base calculation on expected move and stock price
+    expected_move = current_price * calculated_iv * math.sqrt(days_to_expiry/365.0)
+    
+    # Aggressive: Tighter wings = higher profit potential, higher risk
+    # Target: 20-30% of expected move
+    aggressive = max(2, round(expected_move * 0.25))
+    
+    # Balanced: Moderate wings = balanced risk/reward
+    # Target: 40-50% of expected move (sweet spot for most traders)
+    balanced = max(3, round(expected_move * 0.45))
+    
+    # Conservative: Wider wings = lower risk, lower profit
+    # Target: 60-80% of expected move
+    conservative = max(5, round(expected_move * 0.70))
+    
+    # Ensure they're in ascending order and make sense
+    if aggressive >= balanced:
+        balanced = aggressive + 2
+    if balanced >= conservative:
+        conservative = balanced + 3
+    
+    # Round to nice numbers (nearest $1 or $5)
+    if current_price > 500:
+        aggressive = round(aggressive / 5) * 5
+        balanced = round(balanced / 5) * 5
+        conservative = round(conservative / 5) * 5
+    
+    return aggressive, balanced, conservative
+
+def generate_scenario_card(symbol, current_price, days_offset, scenario_name, calculated_iv):
     yf_ticker = yf.Ticker(symbol)
     
     target_date = get_next_trading_day(days_offset)
@@ -402,18 +463,75 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     days_to_expiry = (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
     if days_to_expiry < 1: days_to_expiry = 1
     
-    # Calculate strikes using standard deviations for better placement
-    # Use adjustable multiplier based on timeframe
-    if days_offset <= 3:
-        stdev_mult = strike_stdev * 0.7  # Tighter for very short term
-    elif days_offset <= 7:
-        stdev_mult = strike_stdev * 0.85  # Slightly tighter
-    elif days_offset <= 15:
-        stdev_mult = strike_stdev * 1.0  # Standard
-    else:
-        stdev_mult = strike_stdev * 1.15  # Wider for longer term
+    # Calculate optimal wing widths for this timeframe
+    aggressive_width, balanced_width, conservative_width = calculate_optimal_wing_widths(
+        current_price, calculated_iv, days_to_expiry
+    )
     
-    move = current_price * target_iv * math.sqrt(days_to_expiry/365.0) * stdev_mult
+    st.markdown(f"<div class='strategy-header'>🎯 {scenario_name}</div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class='alert-box alert-info'>
+        📅 Expiration: {expiry_str} ({days_to_expiry} days away) | 
+        📊 Using IV: {calculated_iv*100:.1f}%
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Display optimal wing widths
+    st.markdown(f"""
+    <div class='strategy-visual'>
+        <h4 style='color: #00d4ff; margin-bottom: 15px;'>📏 Calculated Optimal Wing Widths</h4>
+        <div style='display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;'>
+            <div style='background: rgba(255, 71, 87, 0.2); padding: 15px; border-radius: 8px; border: 2px solid #ff4757;'>
+                <strong style='color: #ff4757;'>🔥 AGGRESSIVE</strong><br>
+                <span style='font-size: 1.5em; color: white;'>${aggressive_width}</span><br>
+                <span style='font-size: 0.85em; color: #a0a0a0;'>Max Profit Focus</span>
+            </div>
+            <div style='background: rgba(0, 212, 255, 0.2); padding: 15px; border-radius: 8px; border: 2px solid #00d4ff;'>
+                <strong style='color: #00d4ff;'>⚖️ BALANCED</strong><br>
+                <span style='font-size: 1.5em; color: white;'>${balanced_width}</span><br>
+                <span style='font-size: 0.85em; color: #a0a0a0;'>Optimal Risk/Reward</span>
+            </div>
+            <div style='background: rgba(46, 213, 115, 0.2); padding: 15px; border-radius: 8px; border: 2px solid #2ed573;'>
+                <strong style='color: #2ed573;'>🛡️ CONSERVATIVE</strong><br>
+                <span style='font-size: 1.5em; color: white;'>${conservative_width}</span><br>
+                <span style='font-size: 0.85em; color: #a0a0a0;'>Safety First</span>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Determine which profiles to show based on sidebar selection
+    profiles_to_show = []
+    if strategy_profile in ["Show All 3", "Aggressive Only"]:
+        profiles_to_show.append(("🔥 Aggressive", aggressive_width, "aggressive"))
+    if strategy_profile in ["Show All 3", "Balanced Only"]:
+        profiles_to_show.append(("⚖️ Balanced", balanced_width, "balanced"))
+    if strategy_profile in ["Show All 3", "Conservative Only"]:
+        profiles_to_show.append(("🛡️ Conservative", conservative_width, "conservative"))
+    
+    # Generate strategies for each selected profile
+    for profile_name, wing_width, profile_key in profiles_to_show:
+        generate_single_strategy(symbol, current_price, days_offset, expiry_str, days_to_expiry, 
+                                calculated_iv, wing_width, profile_name, profile_key, yf_ticker)
+
+def generate_single_strategy(symbol, current_price, days_offset, expiry_str, days_to_expiry, 
+                            calculated_iv, wing_width, profile_name, profile_key, yf_ticker):
+    """Generate a single iron condor strategy with specific wing width"""
+    
+    # Use the calculated IV passed from main
+    actual_iv = calculated_iv
+    
+    # Calculate strikes using standard deviations for better placement
+    if days_offset <= 3:
+        stdev_mult = strike_stdev * 0.7
+    elif days_offset <= 7:
+        stdev_mult = strike_stdev * 0.85
+    elif days_offset <= 15:
+        stdev_mult = strike_stdev * 1.0
+    else:
+        stdev_mult = strike_stdev * 1.15
+    
+    move = current_price * actual_iv * math.sqrt(days_to_expiry/365.0) * stdev_mult
     
     # Round to nearest $1 or $0.50 depending on stock price
     strike_interval = 1.0 if current_price > 100 else 0.50
@@ -423,8 +541,10 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     s_put = round_to_strike(current_price - move, strike_interval)
     l_put = s_put - wing_width
     
-    st.markdown(f"<div class='strategy-header'>🎯 {scenario_name}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='alert-box alert-info'>📅 Expiration: {expiry_str} ({days_to_expiry} days away)</div>", unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class='strategy-card' style='border-left: 5px solid {"#ff4757" if "Aggressive" in profile_name else "#00d4ff" if "Balanced" in profile_name else "#2ed573"}'>
+        <h3 style='margin-top: 0; color: {"#ff4757" if "Aggressive" in profile_name else "#00d4ff" if "Balanced" in profile_name else "#2ed573"}'>{profile_name} Strategy (${wing_width} Wings)</h3>
+    """, unsafe_allow_html=True)
     
     # Fetch prices
     legs = [
@@ -445,9 +565,10 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
         else: 
             total_credit -= price
     
-    # Ensure we have a net credit (if not, adjust strategy explanation)
+    # Ensure we have a net credit
     if total_credit <= 0:
-        st.warning("⚠️ This combination results in a net debit. Consider adjusting wing width or IV estimate.")
+        st.warning(f"⚠️ {profile_name}: This combination results in a net debit. Consider adjusting parameters.")
+        st.markdown("</div>", unsafe_allow_html=True)
         return
     
     # Calculate metrics with improved formulas
@@ -456,9 +577,9 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     
     # Ensure positive max_loss for display
     if max_loss <= 0:
-        max_loss = wing_width * 100 * 0.5  # Estimate if calculation is off
+        max_loss = wing_width * 100 * 0.5
     
-    pop = calculate_probability(current_price, s_call, s_put, target_iv, days_to_expiry)
+    pop = calculate_probability(current_price, s_call, s_put, actual_iv, days_to_expiry)
     
     # Risk/Reward ratio (profit:loss)
     risk_reward = max_profit / max_loss if max_loss > 0 else 0
@@ -466,12 +587,18 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     # Return on Risk (%)
     return_on_risk = (max_profit / max_loss * 100) if max_loss > 0 else 0
     
+    # Breakeven points
+    upper_breakeven = s_call + total_credit
+    lower_breakeven = s_put - total_credit
+    breakeven_range = upper_breakeven - lower_breakeven
+    breakeven_pct = (breakeven_range / current_price) * 100
+    
     # Display strategy visual
     st.markdown(create_strategy_visual(current_price, s_call, l_call, s_put, l_put), unsafe_allow_html=True)
     
     # Metrics row
     st.markdown("<div class='metric-row'>", unsafe_allow_html=True)
-    cols = st.columns(5)
+    cols = st.columns(6)
     
     with cols[0]:
         st.markdown(f"""
@@ -513,81 +640,89 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
         </div>
         """, unsafe_allow_html=True)
     
+    with cols[5]:
+        st.markdown(f"""
+        <div class='metric-box'>
+            <div class='metric-label'>🎯 Profit Range</div>
+            <div class='metric-value'>{breakeven_pct:.1f}%</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
     st.markdown("</div>", unsafe_allow_html=True)
     
-    # Detailed legs breakdown
-    st.markdown("### 📋 Trade Legs Breakdown")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown(f"""
-        <div class='leg-card call-sell'>
-            <div class='leg-header'>🔴 SELL Call (Bear Call Spread - Top)</div>
-            <div class='leg-details'>
-                <strong>Strike:</strong> ${s_call:.2f}<br>
-                <strong>Premium Received:</strong> ${prices[0]:.2f}<br>
-                <strong>Purpose:</strong> Collect income if stock stays below this level<br>
-                <strong>Risk:</strong> Unlimited if unprotected (but we have protection!)
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown(f"""
-        <div class='leg-card call-buy'>
-            <div class='leg-header'>🟠 BUY Call (Protection)</div>
-            <div class='leg-details'>
-                <strong>Strike:</strong> ${l_call:.2f}<br>
-                <strong>Premium Paid:</strong> ${prices[1]:.2f}<br>
-                <strong>Purpose:</strong> Caps maximum loss from short call<br>
-                <strong>Protects:</strong> Against unlimited upside risk
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    with col2:
-        st.markdown(f"""
-        <div class='leg-card put-sell'>
-            <div class='leg-header'>🟢 SELL Put (Bull Put Spread - Bottom)</div>
-            <div class='leg-details'>
-                <strong>Strike:</strong> ${s_put:.2f}<br>
-                <strong>Premium Received:</strong> ${prices[2]:.2f}<br>
-                <strong>Purpose:</strong> Collect income if stock stays above this level<br>
-                <strong>Risk:</strong> Large if unprotected (but we have protection!)
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown(f"""
-        <div class='leg-card put-buy'>
-            <div class='leg-header'>🔵 BUY Put (Protection)</div>
-            <div class='leg-details'>
-                <strong>Strike:</strong> ${l_put:.2f}<br>
-                <strong>Premium Paid:</strong> ${prices[3]:.2f}<br>
-                <strong>Purpose:</strong> Caps maximum loss from short put<br>
-                <strong>Protects:</strong> Against large downside moves
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    
-    # Strategy explanation
-    st.markdown("""
+    # Breakeven analysis
+    st.markdown(f"""
     <div class='alert-box alert-success'>
-        <strong>✅ How This Strategy Works:</strong><br>
-        • You receive a NET CREDIT upfront (the premium collected from selling exceeds what you pay for protection)<br>
-        • Maximum profit occurs if the stock stays between your short strikes at expiration<br>
-        • Your risk is limited to the wing width minus the credit received<br>
-        • This is a NEUTRAL strategy - you want the stock to stay calm and not move much
+        <strong>✅ Profit Zone:</strong> ${lower_breakeven:.2f} to ${upper_breakeven:.2f} 
+        (±{breakeven_pct/2:.1f}% from current price)<br>
+        <strong>📊 Net Credit Collected:</strong> ${total_credit:.2f} per spread
     </div>
     """, unsafe_allow_html=True)
+    
+    # Detailed legs breakdown
+    with st.expander("📋 View Detailed Trade Legs", expanded=False):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown(f"""
+            <div class='leg-card call-sell'>
+                <div class='leg-header'>🔴 SELL Call (Bear Call Spread - Top)</div>
+                <div class='leg-details'>
+                    <strong>Strike:</strong> ${s_call:.2f}<br>
+                    <strong>Premium Received:</strong> ${prices[0]:.2f}<br>
+                    <strong>Purpose:</strong> Collect income if stock stays below this level<br>
+                    <strong>Risk:</strong> Unlimited if unprotected (but we have protection!)
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown(f"""
+            <div class='leg-card call-buy'>
+                <div class='leg-header'>🟠 BUY Call (Protection)</div>
+                <div class='leg-details'>
+                    <strong>Strike:</strong> ${l_call:.2f}<br>
+                    <strong>Premium Paid:</strong> ${prices[1]:.2f}<br>
+                    <strong>Purpose:</strong> Caps maximum loss from short call<br>
+                    <strong>Protects:</strong> Against unlimited upside risk
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div class='leg-card put-sell'>
+                <div class='leg-header'>🟢 SELL Put (Bull Put Spread - Bottom)</div>
+                <div class='leg-details'>
+                    <strong>Strike:</strong> ${s_put:.2f}<br>
+                    <strong>Premium Received:</strong> ${prices[2]:.2f}<br>
+                    <strong>Purpose:</strong> Collect income if stock stays above this level<br>
+                    <strong>Risk:</strong> Large if unprotected (but we have protection!)
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            st.markdown(f"""
+            <div class='leg-card put-buy'>
+                <div class='leg-header'>🔵 BUY Put (Protection)</div>
+                <div class='leg-details'>
+                    <strong>Strike:</strong> ${l_put:.2f}<br>
+                    <strong>Premium Paid:</strong> ${prices[3]:.2f}<br>
+                    <strong>Purpose:</strong> Caps maximum loss from short put<br>
+                    <strong>Protects:</strong> Against large downside moves
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
     
     # Profit/Loss diagram
     with st.expander("📈 View Profit/Loss Diagram", expanded=False):
         st.plotly_chart(
             plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), 
             use_container_width=True, 
-            key=f"chart_{scenario_name}"
+            key=f"chart_{profile_key}_{days_offset}"
         )
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("<br>", unsafe_allow_html=True)
 
 # --- MAIN DASHBOARD ---
 st.markdown("""
@@ -657,6 +792,18 @@ if symbol:
         df = get_stock_data(symbol)
         current_price = df.iloc[-1]['close']
         
+        # Calculate historical volatility automatically
+        historical_iv_30d = calculate_historical_volatility(df, window=30)
+        historical_iv_60d = calculate_historical_volatility(df, window=60)
+        
+        # Use manual IV if selected, otherwise use 30-day historical
+        if iv_mode == "Manual Override":
+            active_iv = target_iv
+            iv_source = "Manual"
+        else:
+            active_iv = historical_iv_30d
+            iv_source = "30-Day Historical"
+        
         # Calculate technical indicators
         df['SMA_50'] = df['close'].rolling(50).mean()
         df['Upper_Band'] = df['SMA_50'] + (df['close'].rolling(20).std() * 2)
@@ -664,14 +811,31 @@ if symbol:
         df['RSI'] = 100 - (100 / (1 + (df['close'].diff().where(lambda x: x > 0, 0).rolling(14).mean() / 
                                        df['close'].diff().where(lambda x: x < 0, 0).abs().rolling(14).mean())))
 
-        # Display current price
-        st.markdown(f"""
-        <div class='alert-box alert-info'>
-            <strong>📊 {symbol} Current Price:</strong> ${current_price:.2f} | 
-            <strong>Data Source:</strong> Alpaca Markets (Last Closing Price) | 
-            <strong>Options Data:</strong> Yahoo Finance
-        </div>
-        """, unsafe_allow_html=True)
+        # Display current price and IV
+        col1, col2, col3 = st.columns([2, 1, 1])
+        
+        with col1:
+            st.markdown(f"""
+            <div class='alert-box alert-info'>
+                <strong>📊 {symbol} Current Price:</strong> ${current_price:.2f}
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown(f"""
+            <div class='metric-box'>
+                <div class='metric-label'>📉 Active IV ({iv_source})</div>
+                <div class='metric-value'>{active_iv*100:.1f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        with col3:
+            st.markdown(f"""
+            <div class='metric-box'>
+                <div class='metric-label'>📊 60-Day IV</div>
+                <div class='metric-value'>{historical_iv_60d*100:.1f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
 
         # Main tabs
         tab1, tab2, tab3 = st.tabs(["🎯 Strategy Builder", "📈 Technical Chart", "📰 Market News"])
@@ -694,22 +858,22 @@ if symbol:
                 with t1:
                     st.markdown("<div class='alert-box alert-warning'>⚡ Ultra-short timeframe - Rapid theta decay, tight strikes</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
-                        generate_scenario_card(symbol, current_price, 3, "3-Day Expiry")
+                        generate_scenario_card(symbol, current_price, 3, "3-Day Expiry", active_iv)
                 
                 with t2:
                     st.markdown("<div class='alert-box alert-success'>📊 Short-term optimal - Sweet spot for many traders</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
-                        generate_scenario_card(symbol, current_price, 7, "7-Day Expiry")
+                        generate_scenario_card(symbol, current_price, 7, "7-Day Expiry", active_iv)
                 
                 with t3:
                     st.markdown("<div class='alert-box alert-success'>📅 Standard iron condor - Best risk/reward ratio</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
-                        generate_scenario_card(symbol, current_price, 15, "15-Day Expiry")
+                        generate_scenario_card(symbol, current_price, 15, "15-Day Expiry", active_iv)
                 
                 with t4:
                     st.markdown("<div class='alert-box alert-info'>📆 Monthly strategy - Maximum premium with more breathing room</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
-                        generate_scenario_card(symbol, current_price, 30, "30-Day Expiry")
+                        generate_scenario_card(symbol, current_price, 30, "30-Day Expiry", active_iv)
             else:
                 st.info("👆 Click the button above to generate iron condor strategies with live market prices")
 
