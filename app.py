@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, date
 import math
 import pandas as pd
 import numpy as np
-import yfinance as yf  # <--- NEW DATA SOURCE
+import yfinance as yf
 
 # --- 1. APP CONFIGURATION ---
 st.set_page_config(page_title="Iron Condor Master", layout="wide", page_icon="🦅")
@@ -109,24 +109,13 @@ def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_c
     fig.update_layout(title="Profit/Loss Diagram", template="plotly_dark", height=300, margin=dict(l=10, r=10, t=30, b=10))
     return fig
 
-# --- 5. YAHOO FINANCE LOGIC (The New Fix) ---
+# --- 5. YAHOO FINANCE LOGIC ---
 def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
-    """
-    Fetches the LAST TRADED PRICE from Yahoo Finance for a specific option.
-    """
     try:
-        # Get the option chain for that date
         opt = ticker_obj.option_chain(expiry_date)
-        
-        # Select Calls or Puts table
         data = opt.calls if option_type == "call" else opt.puts
-        
-        # Find the specific strike row
-        # We look for the strike closest to our target (within 0.5)
         contract_row = data.iloc[(data['strike'] - strike).abs().argsort()[:1]]
-        
         if not contract_row.empty:
-            # Use 'lastPrice' which works even when market is closed
             price = contract_row['lastPrice'].values[0]
             actual_strike = contract_row['strike'].values[0]
             return price, actual_strike
@@ -135,12 +124,8 @@ def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
         return 0.0, strike
 
 def get_closest_expiry_yf(ticker_obj, target_date):
-    """Finds the valid expiration date available in YF closest to our target."""
     avail_dates = ticker_obj.options
-    # Convert strings 'YYYY-MM-DD' to date objects
     valid_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in avail_dates]
-    
-    # Find closest
     closest = min(valid_dates, key=lambda x: abs(x - target_date))
     return closest.strftime("%Y-%m-%d")
 
@@ -151,7 +136,6 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     # 2. Find Correct Expiry
     target_date = get_next_trading_day(days_offset)
     try:
-        # Yahoo Finance requires exact expiration strings
         expiry_str = get_closest_expiry_yf(yf_ticker, target_date)
     except:
         st.error("No options data found in Yahoo Finance.")
@@ -170,7 +154,6 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
     st.markdown(f"### {scenario_name} (Exp: {expiry_str})")
     
     # 4. Fetch Prices from Yahoo
-    # (Strike, Type, Side)
     legs = [
         (s_call, "call", "SELL"),
         (l_call, "call", "BUY"),
@@ -210,7 +193,8 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
         </div>""", unsafe_allow_html=True)
         
     with st.expander("See Graph"):
-         st.plotly_chart(plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), use_container_width=True)
+         # FIX: Added unique key using scenario_name to prevent duplicate ID error
+         st.plotly_chart(plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), use_container_width=True, key=f"chart_{scenario_name}")
 
 
 # --- 6. MAIN DASHBOARD ---
@@ -218,7 +202,7 @@ st.title(f"🦅 {symbol} Multi-Timeframe Analyzer")
 
 if symbol:
     try:
-        # Load Stock Data (Alpaca is still great for this)
+        # Load Stock Data
         df = get_stock_data(symbol)
         current_price = df.iloc[-1]['close']
         
