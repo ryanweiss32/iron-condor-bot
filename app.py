@@ -1,6 +1,10 @@
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 from datetime import datetime, timedelta, date
 import math
 import pandas as pd
@@ -9,6 +13,14 @@ import yfinance as yf
 
 # --- APP CONFIGURATION ---
 st.set_page_config(page_title="Iron Condor Strategy Builder", layout="wide", page_icon="🦅")
+
+# Popular stocks by price range for screening
+STOCK_UNIVERSE = {
+    "under_50": ["F", "SOFI", "NIO", "PLTR", "SNAP", "AAL", "RIVN", "LCID", "PLUG", "VALE"],
+    "under_100": ["AMD", "UBER", "SNOW", "ABNB", "DKNG", "RBLX", "COIN", "NET", "HOOD", "ZM"],
+    "under_500": ["NVDA", "TSLA", "NFLX", "META", "GOOGL", "AMZN", "AVGO", "SHOP", "AAPL", "MSFT"],
+    "premium": ["SPY", "QQQ", "IWM", "DIA"]
+}
 
 st.markdown("""
 <style>
@@ -21,6 +33,53 @@ st.markdown("""
         color: white;
         text-align: center;
     }
+    
+    /* Stock Suggestion Cards */
+    .suggestion-card {
+        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+        padding: 20px;
+        border-radius: 12px;
+        margin: 15px 0;
+        border-left: 5px solid;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+    }
+    
+    .suggestion-hot { border-color: #ff4757; }
+    .suggestion-moderate { border-color: #ffa502; }
+    .suggestion-cool { border-color: #1e90ff; }
+    
+    .stock-header {
+        font-size: 1.4em;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+    
+    .stock-metrics {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 10px;
+        margin: 15px 0;
+    }
+    
+    .stock-metric-item {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 10px;
+        border-radius: 8px;
+        text-align: center;
+    }
+    
+    .recommendation-badge {
+        display: inline-block;
+        padding: 8px 15px;
+        border-radius: 20px;
+        font-weight: bold;
+        margin: 5px;
+        font-size: 0.9em;
+    }
+    
+    .badge-buy { background: #2ed573; color: white; }
+    .badge-watch { background: #ffa502; color: white; }
+    .badge-caution { background: #ff4757; color: white; }
     
     /* Educational Cards */
     .info-card {
@@ -217,9 +276,10 @@ with st.sidebar:
                                 help="Choose which risk profiles to display")
     
     iv_mode = st.radio("IV Calculation Method", 
-                      ["Auto (Historical)", "Manual Override"],
-                      help="Auto calculates IV from recent price action. Manual lets you set your own.")
+                       ["Auto (Historical)", "Manual Override"],
+                       help="Auto calculates IV from recent price action. Manual lets you set your own.")
     
+    target_iv = 0.20
     if iv_mode == "Manual Override":
         target_iv = st.number_input("📉 Implied Volatility", 0.1, 1.0, 0.20, step=0.01,
                                    help="Expected volatility. Higher IV = wider spreads needed.")
@@ -298,224 +358,6 @@ def get_stock_data(sym):
     return stock_client.get_stock_bars(req).df.reset_index()
 
 def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
-    """
-    Analyze a stock's suitability for iron condor strategies
-    Returns: dict with analysis metrics
-    """
-    try:
-        # Get basic stock data
-        yf_ticker = yf.Ticker(symbol)
-        info = yf_ticker.info
-        current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-        
-        if current_price == 0:
-            return None
-        
-        # Get historical data for IV calculation
-        hist = yf_ticker.history(period="60d")
-        if len(hist) < 30:
-            return None
-        
-        # Calculate 30-day IV
-        hist['returns'] = hist['Close'].pct_change()
-        volatility = hist['returns'].tail(30).std() * np.sqrt(252)
-        
-        # Get recent news sentiment (simple version)
-        try:
-            news = yf_ticker.news[:3] if hasattr(yf_ticker, 'news') else []
-            news_count = len(news)
-        except:
-            news_count = 0
-        
-        # Calculate price momentum
-        price_change_30d = ((current_price - hist['Close'].iloc[-30]) / hist['Close'].iloc[-30]) * 100
-        
-        # Check if options are available
-        try:
-            options_dates = yf_ticker.options
-            has_options = len(options_dates) > 0
-        except:
-            has_options = False
-        
-        if not has_options:
-            return None
-        
-        # Volume analysis
-        avg_volume = info.get('averageVolume', 0)
-        
-        # Determine IV rank (simplified)
-        hist['volatility_60d'] = hist['returns'].rolling(60).std() * np.sqrt(252)
-        iv_percentile = (volatility / hist['volatility_60d'].max()) * 100 if hist['volatility_60d'].max() > 0 else 50
-        
-        # Score the stock for iron condor suitability (0-100)
-        score = 0
-        
-        # High IV is good for iron condors (selling premium)
-        if 0.20 <= volatility <= 0.50:
-            score += 30
-        elif 0.15 <= volatility < 0.20 or 0.50 < volatility <= 0.60:
-            score += 20
-        else:
-            score += 10
-        
-        # Moderate price movement is ideal
-        if abs(price_change_30d) < 5:
-            score += 25
-        elif abs(price_change_30d) < 10:
-            score += 15
-        else:
-            score += 5
-        
-        # High volume is important
-        if avg_volume > 5000000:
-            score += 20
-        elif avg_volume > 1000000:
-            score += 15
-        else:
-            score += 5
-        
-        # News activity (moderate is good)
-        if news_count >= 2:
-            score += 15
-        elif news_count >= 1:
-            score += 10
-        else:
-            score += 5
-        
-        # High IV rank is ideal
-        if iv_percentile > 70:
-            score += 10
-        elif iv_percentile > 50:
-            score += 5
-        
-        # Generate recommendation
-        if score >= 70:
-            recommendation = "Strong Buy"
-            badge_class = "badge-buy"
-        elif score >= 50:
-            recommendation = "Consider"
-            badge_class = "badge-watch"
-        else:
-            recommendation = "Monitor"
-            badge_class = "badge-caution"
-        
-        return {
-            'symbol': symbol,
-            'price': current_price,
-            'iv': volatility,
-            'iv_percentile': iv_percentile,
-            'price_change_30d': price_change_30d,
-            'volume': avg_volume,
-            'news_count': news_count,
-            'score': score,
-            'recommendation': recommendation,
-            'badge_class': badge_class,
-            'category': price_range_category
-        }
-    except Exception as e:
-        return None
-
-def scan_stocks_by_price_range(price_range_key, top_n=3):
-    """Scan stocks in a price range and return top candidates"""
-    stocks = STOCK_UNIVERSE.get(price_range_key, [])
-    results = []
-    
-    with st.spinner(f"Analyzing {len(stocks)} stocks..."):
-        for symbol in stocks:
-            analysis = analyze_stock_for_iron_condor(symbol, price_range_key)
-            if analysis:
-                results.append(analysis)
-    
-    # Sort by score
-    results.sort(key=lambda x: x['score'], reverse=True)
-    return results[:top_n]
-
-def analyze_stock_for_iron_condor(symbol, price_range_category):
-    """Display a stock suggestion card"""
-    
-    # Determine heat level for styling
-    if analysis['iv'] > 0.40:
-        heat_class = "suggestion-hot"
-        heat_emoji = "🔥"
-        heat_text = "HIGH VOLATILITY"
-    elif analysis['iv'] > 0.25:
-        heat_class = "suggestion-moderate"
-        heat_emoji = "📊"
-        heat_text = "MODERATE VOLATILITY"
-    else:
-        heat_class = "suggestion-cool"
-        heat_emoji = "❄️"
-        heat_text = "LOW VOLATILITY"
-    
-    st.markdown(f"""
-    <div class='suggestion-card {heat_class}'>
-        <div class='stock-header'>
-            {heat_emoji} ${analysis['symbol']} - ${analysis['price']:.2f}
-            <span class='recommendation-badge {analysis['badge_class']}'>{analysis['recommendation']}</span>
-        </div>
-        
-        <div style='color: #ffd700; font-size: 1.1em; margin: 10px 0;'>
-            {heat_text} | IV: {analysis['iv']*100:.1f}% (Rank: {analysis['iv_percentile']:.0f}th percentile)
-        </div>
-        
-        <div class='stock-metrics'>
-            <div class='stock-metric-item'>
-                <div style='color: #a0a0a0; font-size: 0.85em;'>30-Day Move</div>
-                <div style='color: {"#2ed573" if abs(analysis["price_change_30d"]) < 5 else "#ffa502" if abs(analysis["price_change_30d"]) < 10 else "#ff4757"}; font-size: 1.2em; font-weight: bold;'>
-                    {analysis['price_change_30d']:+.2f}%
-                </div>
-            </div>
-            
-            <div class='stock-metric-item'>
-                <div style='color: #a0a0a0; font-size: 0.85em;'>Avg Volume</div>
-                <div style='color: white; font-size: 1.2em; font-weight: bold;'>
-                    {analysis['volume']/1000000:.1f}M
-                </div>
-            </div>
-            
-            <div class='stock-metric-item'>
-                <div style='color: #a0a0a0; font-size: 0.85em;'>Suitability Score</div>
-                <div style='color: {"#2ed573" if analysis["score"] >= 70 else "#ffa502" if analysis["score"] >= 50 else "#ff4757"}; font-size: 1.2em; font-weight: bold;'>
-                    {analysis['score']}/100
-                </div>
-            </div>
-            
-            <div class='stock-metric-item'>
-                <div style='color: #a0a0a0; font-size: 0.85em;'>Recent News</div>
-                <div style='color: white; font-size: 1.2em; font-weight: bold;'>
-                    {analysis['news_count']} articles
-                </div>
-            </div>
-        </div>
-        
-        <div style='margin-top: 15px; padding: 12px; background: rgba(0,0,0,0.3); border-radius: 8px;'>
-            <strong style='color: #00d4ff;'>💡 Why This Stock?</strong><br>
-            <span style='font-size: 0.95em;'>
-                {'• High IV = More premium to collect<br>' if analysis['iv'] > 0.30 else ''}
-                {'• Stable price action = Lower risk<br>' if abs(analysis['price_change_30d']) < 5 else ''}
-                {'• High volume = Easy to enter/exit<br>' if analysis['volume'] > 5000000 else ''}
-                {'• Recent news activity = Volatility opportunities<br>' if analysis['news_count'] >= 2 else ''}
-                • Options available with multiple expirations
-            </span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def calculate_historical_volatility(df, window=30):
-    """Calculate annualized historical volatility from price data"""
-    if len(df) < window:
-        window = len(df)
-    
-    # Calculate daily returns
-    df['returns'] = df['close'].pct_change()
-    
-    # Calculate standard deviation of returns
-    volatility = df['returns'].tail(window).std()
-    
-    # Annualize (252 trading days per year)
-    annual_volatility = volatility * np.sqrt(252)
-    
-    return annual_volatility
     try:
         opt = ticker_obj.option_chain(expiry_date)
         data = opt.calls if option_type == "call" else opt.puts
@@ -578,7 +420,7 @@ def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_c
         (long_put, "Long Put", "#1e90ff")
     ]:
         fig.add_vline(x=strike, line_dash="dot", line_color=color, 
-                     line_width=2, opacity=0.6)
+                      line_width=2, opacity=0.6)
     
     fig.update_layout(
         title="Profit/Loss at Expiration",
@@ -622,37 +464,16 @@ def create_strategy_visual(current_price, short_call, long_call, short_put, long
     """
 
 def calculate_optimal_wing_widths(current_price, calculated_iv, days_to_expiry):
-    """
-    Calculate three optimal wing widths based on different risk profiles
-    Returns: (aggressive_width, balanced_width, conservative_width)
-    """
-    # Base calculation on expected move and stock price
     expected_move = current_price * calculated_iv * math.sqrt(days_to_expiry/365.0)
-    
-    # Aggressive: Tighter wings = higher profit potential, higher risk
-    # Target: 20-30% of expected move
     aggressive = max(2, round(expected_move * 0.25))
-    
-    # Balanced: Moderate wings = balanced risk/reward
-    # Target: 40-50% of expected move (sweet spot for most traders)
     balanced = max(3, round(expected_move * 0.45))
-    
-    # Conservative: Wider wings = lower risk, lower profit
-    # Target: 60-80% of expected move
     conservative = max(5, round(expected_move * 0.70))
-    
-    # Ensure they're in ascending order and make sense
-    if aggressive >= balanced:
-        balanced = aggressive + 2
-    if balanced >= conservative:
-        conservative = balanced + 3
-    
-    # Round to nice numbers (nearest $1 or $5)
+    if aggressive >= balanced: balanced = aggressive + 2
+    if balanced >= conservative: conservative = balanced + 3
     if current_price > 500:
         aggressive = round(aggressive / 5) * 5
         balanced = round(balanced / 5) * 5
         conservative = round(conservative / 5) * 5
-    
     return aggressive, balanced, conservative
 
 def generate_scenario_card(symbol, current_price, days_offset, scenario_name, calculated_iv):
@@ -668,7 +489,6 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name, ca
     days_to_expiry = (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
     if days_to_expiry < 1: days_to_expiry = 1
     
-    # Calculate optimal wing widths for this timeframe
     aggressive_width, balanced_width, conservative_width = calculate_optimal_wing_widths(
         current_price, calculated_iv, days_to_expiry
     )
@@ -681,7 +501,6 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name, ca
     </div>
     """, unsafe_allow_html=True)
     
-    # Display optimal wing widths
     st.markdown(f"""
     <div class='strategy-visual'>
         <h4 style='color: #00d4ff; margin-bottom: 15px;'>📏 Calculated Optimal Wing Widths</h4>
@@ -705,7 +524,6 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name, ca
     </div>
     """, unsafe_allow_html=True)
     
-    # Determine which profiles to show based on sidebar selection
     profiles_to_show = []
     if strategy_profile in ["Show All 3", "Aggressive Only"]:
         profiles_to_show.append(("🔥 Aggressive", aggressive_width, "aggressive"))
@@ -714,19 +532,15 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name, ca
     if strategy_profile in ["Show All 3", "Conservative Only"]:
         profiles_to_show.append(("🛡️ Conservative", conservative_width, "conservative"))
     
-    # Generate strategies for each selected profile
     for profile_name, wing_width, profile_key in profiles_to_show:
         generate_single_strategy(symbol, current_price, days_offset, expiry_str, days_to_expiry, 
                                 calculated_iv, wing_width, profile_name, profile_key, yf_ticker)
 
 def generate_single_strategy(symbol, current_price, days_offset, expiry_str, days_to_expiry, 
                             calculated_iv, wing_width, profile_name, profile_key, yf_ticker):
-    """Generate a single iron condor strategy with specific wing width"""
     
-    # Use the calculated IV passed from main
     actual_iv = calculated_iv
     
-    # Calculate strikes using standard deviations for better placement
     if days_offset <= 3:
         stdev_mult = strike_stdev * 0.7
     elif days_offset <= 7:
@@ -737,8 +551,6 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
         stdev_mult = strike_stdev * 1.15
     
     move = current_price * actual_iv * math.sqrt(days_to_expiry/365.0) * stdev_mult
-    
-    # Round to nearest $1 or $0.50 depending on stock price
     strike_interval = 1.0 if current_price > 100 else 0.50
     
     s_call = round_to_strike(current_price + move, strike_interval)
@@ -751,7 +563,6 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
         <h3 style='margin-top: 0; color: {"#ff4757" if "Aggressive" in profile_name else "#00d4ff" if "Balanced" in profile_name else "#2ed573"}'>{profile_name} Strategy (${wing_width} Wings)</h3>
     """, unsafe_allow_html=True)
     
-    # Fetch prices
     legs = [
         (s_call, "call", "SELL", "Short Call"),
         (l_call, "call", "BUY", "Long Call"),
@@ -770,38 +581,27 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
         else: 
             total_credit -= price
     
-    # Ensure we have a net credit
     if total_credit <= 0:
         st.warning(f"⚠️ {profile_name}: This combination results in a net debit. Consider adjusting parameters.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
     
-    # Calculate metrics with improved formulas
     max_profit = total_credit * 100
     max_loss = (wing_width * 100) - max_profit
     
-    # Ensure positive max_loss for display
-    if max_loss <= 0:
-        max_loss = wing_width * 100 * 0.5
+    if max_loss <= 0: max_loss = wing_width * 100 * 0.5
     
     pop = calculate_probability(current_price, s_call, s_put, actual_iv, days_to_expiry)
-    
-    # Risk/Reward ratio (profit:loss)
     risk_reward = max_profit / max_loss if max_loss > 0 else 0
-    
-    # Return on Risk (%)
     return_on_risk = (max_profit / max_loss * 100) if max_loss > 0 else 0
     
-    # Breakeven points
     upper_breakeven = s_call + total_credit
     lower_breakeven = s_put - total_credit
     breakeven_range = upper_breakeven - lower_breakeven
     breakeven_pct = (breakeven_range / current_price) * 100
     
-    # Display strategy visual
     st.markdown(create_strategy_visual(current_price, s_call, l_call, s_put, l_put), unsafe_allow_html=True)
     
-    # Metrics row
     st.markdown("<div class='metric-row'>", unsafe_allow_html=True)
     cols = st.columns(6)
     
@@ -855,7 +655,6 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
     
     st.markdown("</div>", unsafe_allow_html=True)
     
-    # Breakeven analysis
     st.markdown(f"""
     <div class='alert-box alert-success'>
         <strong>✅ Profit Zone:</strong> ${lower_breakeven:.2f} to ${upper_breakeven:.2f} 
@@ -864,7 +663,6 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
     </div>
     """, unsafe_allow_html=True)
     
-    # Detailed legs breakdown
     with st.expander("📋 View Detailed Trade Legs", expanded=False):
         col1, col2 = st.columns(2)
         
@@ -918,7 +716,6 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
             </div>
             """, unsafe_allow_html=True)
     
-    # Profit/Loss diagram
     with st.expander("📈 View Profit/Loss Diagram", expanded=False):
         st.plotly_chart(
             plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), 
@@ -928,6 +725,141 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
     
     st.markdown("</div>", unsafe_allow_html=True)
     st.markdown("<br>", unsafe_allow_html=True)
+
+def analyze_stock_for_iron_condor(symbol, price_range_category):
+    try:
+        yf_ticker = yf.Ticker(symbol)
+        info = yf_ticker.info
+        current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
+        
+        if current_price == 0: return None
+        
+        hist = yf_ticker.history(period="60d")
+        if len(hist) < 30: return None
+        
+        hist['returns'] = hist['Close'].pct_change()
+        volatility = hist['returns'].tail(30).std() * np.sqrt(252)
+        
+        news_count = len(yf_ticker.news) if hasattr(yf_ticker, 'news') else 0
+        price_change_30d = ((current_price - hist['Close'].iloc[-30]) / hist['Close'].iloc[-30]) * 100
+        
+        try:
+            has_options = len(yf_ticker.options) > 0
+        except:
+            has_options = False
+        
+        if not has_options: return None
+        
+        avg_volume = info.get('averageVolume', 0)
+        
+        score = 0
+        if 0.20 <= volatility <= 0.50: score += 30
+        elif 0.15 <= volatility < 0.20 or 0.50 < volatility <= 0.60: score += 20
+        else: score += 10
+        
+        if abs(price_change_30d) < 5: score += 25
+        elif abs(price_change_30d) < 10: score += 15
+        else: score += 5
+        
+        if avg_volume > 5000000: score += 20
+        elif avg_volume > 1000000: score += 15
+        else: score += 5
+        
+        if news_count >= 2: score += 15
+        elif news_count >= 1: score += 10
+        else: score += 5
+        
+        recommendation = "Strong Buy" if score >= 70 else "Consider" if score >= 50 else "Monitor"
+        badge_class = "badge-buy" if score >= 70 else "badge-watch" if score >= 50 else "badge-caution"
+        
+        return {
+            'symbol': symbol, 'price': current_price, 'iv': volatility,
+            'price_change_30d': price_change_30d, 'volume': avg_volume,
+            'news_count': news_count, 'score': score,
+            'recommendation': recommendation, 'badge_class': badge_class
+        }
+    except:
+        return None
+
+def scan_stocks_by_price_range(price_range_key, top_n=3):
+    stocks = STOCK_UNIVERSE.get(price_range_key, [])
+    results = []
+    with st.spinner(f"Analyzing {len(stocks)} stocks..."):
+        for symbol in stocks:
+            analysis = analyze_stock_for_iron_condor(symbol, price_range_key)
+            if analysis: results.append(analysis)
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return results[:top_n]
+
+def display_stock_suggestion(analysis):
+    if analysis['iv'] > 0.40:
+        heat_class = "suggestion-hot"
+        heat_emoji = "🔥"
+        heat_text = "HIGH VOLATILITY"
+    elif analysis['iv'] > 0.25:
+        heat_class = "suggestion-moderate"
+        heat_emoji = "📊"
+        heat_text = "MODERATE VOLATILITY"
+    else:
+        heat_class = "suggestion-cool"
+        heat_emoji = "❄️"
+        heat_text = "LOW VOLATILITY"
+    
+    st.markdown(f"""
+    <div class='suggestion-card {heat_class}'>
+        <div class='stock-header'>
+            {heat_emoji} ${analysis['symbol']} - ${analysis['price']:.2f}
+            <span class='recommendation-badge {analysis['badge_class']}'>{analysis['recommendation']}</span>
+        </div>
+        <div style='color: #ffd700; font-size: 1.1em; margin: 10px 0;'>
+            {heat_text} | IV: {analysis['iv']*100:.1f}%
+        </div>
+        <div class='stock-metrics'>
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>30-Day Move</div>
+                <div style='color: {"#2ed573" if abs(analysis["price_change_30d"]) < 5 else "#ffa502" if abs(analysis["price_change_30d"]) < 10 else "#ff4757"}; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['price_change_30d']:+.2f}%
+                </div>
+            </div>
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>Avg Volume</div>
+                <div style='color: white; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['volume']/1000000:.1f}M
+                </div>
+            </div>
+            <div class='stock-metric-item'>
+                <div style='color: #a0a0a0; font-size: 0.85em;'>Score</div>
+                <div style='color: {"#2ed573" if analysis["score"] >= 70 else "#ffa502" if analysis["score"] >= 50 else "#ff4757"}; font-size: 1.2em; font-weight: bold;'>
+                    {analysis['score']}/100
+                </div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def get_market_overview():
+    try:
+        spy = yf.Ticker("SPY")
+        hist = spy.history(period="5d")
+        if len(hist) > 0:
+            current = hist['Close'].iloc[-1]
+            change = ((current - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
+            
+            vix = yf.Ticker("^VIX")
+            vix_hist = vix.history(period="1d")
+            vix_level = vix_hist['Close'].iloc[-1] if len(vix_hist) > 0 else 0
+            
+            return {'spy_price': current, 'spy_change': change, 'vix_level': vix_level}
+        return None
+    except:
+        return None
+
+def get_news_data(sym):
+    try:
+        ticker = yf.Ticker(sym)
+        return ticker.news
+    except:
+        return []
 
 # --- MAIN DASHBOARD ---
 st.markdown("""
@@ -960,9 +892,9 @@ with st.expander("📚 Learn: What is an Iron Condor?", expanded=False):
         <div class='info-card'>
             <h3>💰 Profit & Loss</h3>
             <ul>
-                <li><strong>Max Profit:</strong> Net credit received (happens if stock stays in range)</li>
-                <li><strong>Max Loss:</strong> Wing width - Net credit (if stock moves outside range)</li>
-                <li><strong>Breakeven:</strong> Two points - at short strikes ± net credit</li>
+                <li><strong>Max Profit:</strong> Net credit received</li>
+                <li><strong>Max Loss:</strong> Wing width - Net credit</li>
+                <li><strong>Breakeven:</strong> Short strikes ± net credit</li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
@@ -974,27 +906,14 @@ with st.expander("📚 Learn: What is an Iron Condor?", expanded=False):
             <ul>
                 <li>Expecting <strong>low volatility</strong></li>
                 <li>Stock trading <strong>sideways</strong></li>
-                <li>Want <strong>defined risk</strong> (no surprises)</li>
-                <li>Looking for <strong>income generation</strong></li>
-                <li>Short time frames (7-45 days)</li>
-            </ul>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        st.markdown("""
-        <div class='info-card'>
-            <h3>⚠️ Key Risks</h3>
-            <ul>
-                <li><strong>Large moves:</strong> Big price swings can hit max loss</li>
-                <li><strong>Early assignment:</strong> Short options can be assigned early</li>
-                <li><strong>Volatility expansion:</strong> Spreads widen when IV increases</li>
+                <li>Want <strong>defined risk</strong></li>
             </ul>
         </div>
         """, unsafe_allow_html=True)
 
 if symbol:
     try:
-        df = get_stock_data(symbol, days=days_back)
+        df = get_stock_data(symbol)
         
         if df is None or len(df) == 0:
             st.error("Unable to fetch stock data. Please check the ticker symbol.")
@@ -1006,7 +925,6 @@ if symbol:
         historical_iv_30d = calculate_historical_volatility(df, window=30)
         historical_iv_60d = calculate_historical_volatility(df, window=60)
         
-        # Use manual IV if selected, otherwise use 30-day historical
         if iv_mode == "Manual Override":
             active_iv = target_iv
             iv_source = "Manual"
@@ -1014,14 +932,14 @@ if symbol:
             active_iv = historical_iv_30d
             iv_source = "30-Day Historical"
         
-        # Calculate technical indicators
+        # Technical indicators
         df['SMA_50'] = df['close'].rolling(50).mean()
         df['Upper_Band'] = df['SMA_50'] + (df['close'].rolling(20).std() * 2)
         df['Lower_Band'] = df['SMA_50'] - (df['close'].rolling(20).std() * 2)
         df['RSI'] = 100 - (100 / (1 + (df['close'].diff().where(lambda x: x > 0, 0).rolling(14).mean() / 
-                                       df['close'].diff().where(lambda x: x < 0, 0).abs().rolling(14).mean())))
+                                        df['close'].diff().where(lambda x: x < 0, 0).abs().rolling(14).mean())))
 
-        # Display current price and IV
+        # Header Metrics
         col1, col2, col3 = st.columns([2, 1, 1])
         
         with col1:
@@ -1052,215 +970,79 @@ if symbol:
 
         with tab1:
             st.markdown("### Generate Iron Condor Strategies")
-            st.markdown("""
-            <div class='alert-box alert-info'>
-                <strong>💡 Recommended Timeframes:</strong><br>
-                • <strong>3 Days:</strong> Quick scalp - High theta decay, needs tight management<br>
-                • <strong>7 Days:</strong> Short-term income - Good balance of premium and time<br>
-                • <strong>15 Days:</strong> Standard trade - Ideal risk/reward balance<br>
-                • <strong>30 Days:</strong> Monthly income - Maximum premium collection
-            </div>
-            """, unsafe_allow_html=True)
             
             if st.button("🚀 GENERATE ALL TIMEFRAMES", use_container_width=True):
                 t1, t2, t3, t4 = st.tabs(["⚡ 3-Day", "📊 7-Day", "📅 15-Day", "📆 30-Day"])
                 
                 with t1:
-                    st.markdown("<div class='alert-box alert-warning'>⚡ Ultra-short timeframe - Rapid theta decay, tight strikes</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
                         generate_scenario_card(symbol, current_price, 3, "3-Day Expiry", active_iv)
                 
                 with t2:
-                    st.markdown("<div class='alert-box alert-success'>📊 Short-term optimal - Sweet spot for many traders</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
                         generate_scenario_card(symbol, current_price, 7, "7-Day Expiry", active_iv)
                 
                 with t3:
-                    st.markdown("<div class='alert-box alert-success'>📅 Standard iron condor - Best risk/reward ratio</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
                         generate_scenario_card(symbol, current_price, 15, "15-Day Expiry", active_iv)
                 
                 with t4:
-                    st.markdown("<div class='alert-box alert-info'>📆 Monthly strategy - Maximum premium with more breathing room</div>", unsafe_allow_html=True)
                     with st.spinner("Fetching market data..."):
                         generate_scenario_card(symbol, current_price, 30, "30-Day Expiry", active_iv)
             else:
-                st.info("👆 Click the button above to generate iron condor strategies with live market prices")
+                st.info("👆 Click the button above to generate iron condor strategies")
 
         with tab2:
             st.markdown("### 🔍 AI-Powered Stock Screener")
-            st.markdown("""
-            <div class='alert-box alert-info'>
-                <strong>🎯 What We're Looking For:</strong><br>
-                • <strong>Moderate to High IV</strong> - More premium to collect<br>
-                • <strong>Stable Price Action</strong> - Less directional risk<br>
-                • <strong>High Liquidity</strong> - Easy entry and exit<br>
-                • <strong>Active Options Market</strong> - Multiple expirations available<br>
-                • <strong>Recent News</strong> - Volatility catalysts without extreme moves
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Market overview
             market_data = get_market_overview()
             if market_data:
                 col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.markdown(f"""
-                    <div class='metric-box'>
-                        <div class='metric-label'>📊 SPY Price</div>
-                        <div class='metric-value'>${market_data['spy_price']:.2f}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"<div class='metric-box'><div class='metric-label'>📊 SPY Price</div><div class='metric-value'>${market_data['spy_price']:.2f}</div></div>", unsafe_allow_html=True)
                 with col2:
-                    st.markdown(f"""
-                    <div class='metric-box'>
-                        <div class='metric-label'>📈 5-Day Change</div>
-                        <div class='metric-value' style='color: {"#2ed573" if market_data["spy_change"] >= 0 else "#ff4757"}'>{market_data['spy_change']:+.2f}%</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"<div class='metric-box'><div class='metric-label'>📈 5-Day Change</div><div class='metric-value' style='color: {'#2ed573' if market_data['spy_change'] >= 0 else '#ff4757'}'>{market_data['spy_change']:+.2f}%</div></div>", unsafe_allow_html=True)
                 with col3:
-                    st.markdown(f"""
-                    <div class='metric-box'>
-                        <div class='metric-label'>🔥 VIX Level</div>
-                        <div class='metric-value'>{market_data['vix_level']:.2f}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"<div class='metric-box'><div class='metric-label'>🔥 VIX Level</div><div class='metric-value'>{market_data['vix_level']:.2f}</div></div>", unsafe_allow_html=True)
             
             st.markdown("---")
             
-            # Stock suggestions by price range
             if st.button("🔎 SCAN FOR OPPORTUNITIES", use_container_width=True, type="primary"):
-                
                 price_tabs = st.tabs(["💰 Under $50", "💵 $50-$100", "💎 $100-$500", "🏆 Premium ETFs"])
                 
                 with price_tabs[0]:
-                    st.markdown("### Budget-Friendly Opportunities (Under $50)")
-                    st.markdown("""
-                    <div class='alert-box alert-success'>
-                        <strong>✅ Advantages:</strong> Lower capital requirement, easier to deploy multiple contracts<br>
-                        <strong>⚠️ Considerations:</strong> May have wider bid-ask spreads, ensure sufficient liquidity
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
                     suggestions = scan_stocks_by_price_range("under_50", top_n=5)
                     if suggestions:
-                        for analysis in suggestions:
-                            display_stock_suggestion(analysis)
-                    else:
-                        st.warning("No suitable candidates found in this price range at the moment.")
+                        for analysis in suggestions: display_stock_suggestion(analysis)
+                    else: st.warning("No suitable candidates found.")
                 
                 with price_tabs[1]:
-                    st.markdown("### Mid-Range Opportunities ($50-$100)")
-                    st.markdown("""
-                    <div class='alert-box alert-success'>
-                        <strong>✅ Advantages:</strong> Good liquidity, balanced premium collection<br>
-                        <strong>⚠️ Considerations:</strong> Sweet spot for many retail traders
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
                     suggestions = scan_stocks_by_price_range("under_100", top_n=5)
                     if suggestions:
-                        for analysis in suggestions:
-                            display_stock_suggestion(analysis)
-                    else:
-                        st.warning("No suitable candidates found in this price range at the moment.")
+                        for analysis in suggestions: display_stock_suggestion(analysis)
+                    else: st.warning("No suitable candidates found.")
                 
                 with price_tabs[2]:
-                    st.markdown("### High-Value Opportunities ($100-$500)")
-                    st.markdown("""
-                    <div class='alert-box alert-success'>
-                        <strong>✅ Advantages:</strong> Premium stocks, excellent liquidity, substantial premiums<br>
-                        <strong>⚠️ Considerations:</strong> Higher capital requirement, larger potential losses
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
                     suggestions = scan_stocks_by_price_range("under_500", top_n=5)
                     if suggestions:
-                        for analysis in suggestions:
-                            display_stock_suggestion(analysis)
-                    else:
-                        st.warning("No suitable candidates found in this price range at the moment.")
+                        for analysis in suggestions: display_stock_suggestion(analysis)
+                    else: st.warning("No suitable candidates found.")
                 
                 with price_tabs[3]:
-                    st.markdown("### Premium ETF Opportunities")
-                    st.markdown("""
-                    <div class='alert-box alert-info'>
-                        <strong>🏆 Best For:</strong> Consistent premium, lower single-stock risk, diversified exposure<br>
-                        <strong>📊 Ideal For:</strong> Conservative iron condor traders seeking steady income
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
                     suggestions = scan_stocks_by_price_range("premium", top_n=4)
                     if suggestions:
-                        for analysis in suggestions:
-                            display_stock_suggestion(analysis)
-                    else:
-                        st.warning("No suitable ETF candidates found at the moment.")
-            else:
-                st.info("👆 Click to scan the market for the best iron condor opportunities across all price ranges")
+                        for analysis in suggestions: display_stock_suggestion(analysis)
+                    else: st.warning("No suitable candidates found.")
 
-        with tab4:
+        with tab3:
             st.markdown("### Technical Analysis")
-            fig = make_subplots(
-                rows=2, cols=1, 
-                shared_xaxes=True, 
-                vertical_spacing=0.05,
-                row_heights=[0.7, 0.3],
-                subplot_titles=('Price Action with Bollinger Bands', 'RSI Indicator')
-            )
-            
-            # Candlestick chart
-            fig.add_trace(go.Candlestick(
-                x=df['timestamp'],
-                open=df['open'],
-                high=df['high'],
-                low=df['low'],
-                close=df['close'],
-                name='Price'
-            ), row=1, col=1)
-            
-            # Bollinger Bands
-            fig.add_trace(go.Scatter(
-                x=df['timestamp'], 
-                y=df['Upper_Band'],
-                line=dict(color='rgba(255, 152, 0, 0.5)', width=1, dash='dot'),
-                name='Upper Band'
-            ), row=1, col=1)
-            
-            fig.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['Lower_Band'],
-                line=dict(color='rgba(255, 152, 0, 0.5)', width=1, dash='dot'),
-                name='Lower Band',
-                fill='tonexty',
-                fillcolor='rgba(255, 152, 0, 0.1)'
-            ), row=1, col=1)
-            
-            # RSI
-            fig.add_trace(go.Scatter(
-                x=df['timestamp'],
-                y=df['RSI'],
-                line=dict(color='#A020F0', width=2),
-                name='RSI'
-            ), row=2, col=1)
-            
-            # RSI levels
-            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought")
-            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold")
-            
-            fig.update_layout(
-                height=700,
-                template="plotly_dark",
-                xaxis_rangeslider_visible=False,
-                plot_bgcolor='#1a1a2e',
-                paper_bgcolor='#0f0f1e',
-                showlegend=True
-            )
-            
-            fig.update_xaxes(title_text="Date", row=2, col=1)
-            fig.update_yaxes(title_text="Price ($)", row=1, col=1)
-            fig.update_yaxes(title_text="RSI", row=2, col=1)
-            
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+            fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Upper_Band'], line=dict(color='rgba(255, 152, 0, 0.5)', width=1, dash='dot'), name='Upper Band'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Lower_Band'], line=dict(color='rgba(255, 152, 0, 0.5)', width=1, dash='dot'), name='Lower Band', fill='tonexty', fillcolor='rgba(255, 152, 0, 0.1)'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], line=dict(color='#A020F0', width=2), name='RSI'), row=2, col=1)
+            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1)
+            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1)
+            fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
         with tab4:
@@ -1269,33 +1051,22 @@ if symbol:
             if news:
                 for article in news:
                     try:
-                        # Yahoo Finance news format
                         title = article.get('title', 'No title')
                         link = article.get('link', '#')
                         publisher = article.get('publisher', 'Unknown')
                         pub_time = article.get('providerPublishTime', 0)
-                        
-                        if pub_time:
-                            from datetime import datetime
-                            pub_date = datetime.fromtimestamp(pub_time).strftime('%Y-%m-%d %H:%M')
-                        else:
-                            pub_date = 'Unknown date'
+                        pub_date = datetime.fromtimestamp(pub_time).strftime('%Y-%m-%d %H:%M') if pub_time else 'Unknown'
                         
                         st.markdown(f"""
                         <div class='info-card'>
                             <h3>📄 {title}</h3>
-                            <p style='color: #a0a0a0; font-size: 0.9em;'>
-                                <strong>Source:</strong> {publisher} | 
-                                <strong>Date:</strong> {pub_date}
-                            </p>
+                            <p style='color: #a0a0a0; font-size: 0.9em;'><strong>Source:</strong> {publisher} | <strong>Date:</strong> {pub_date}</p>
                             <a href='{link}' target='_blank' style='color: #00d4ff;'>Read Full Article →</a>
                         </div>
                         """, unsafe_allow_html=True)
-                    except Exception as e:
-                        continue
+                    except: continue
             else:
-                st.markdown("<div class='alert-box alert-warning'>No recent news found for this symbol.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='alert-box alert-warning'>No recent news found.</div>", unsafe_allow_html=True)
 
     except Exception as e:
         st.error(f"❌ Error loading data: {e}")
-        st.info("Please check your ticker symbol and try again. Make sure it's a valid stock symbol (e.g., SPY, AAPL, TSLA).")
