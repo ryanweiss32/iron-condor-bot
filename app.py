@@ -1,11 +1,6 @@
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import StockBarsRequest, NewsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
 from datetime import datetime, timedelta, date
 import math
 import pandas as pd
@@ -302,7 +297,7 @@ def get_stock_data(sym):
     )
     return stock_client.get_stock_bars(req).df.reset_index()
 
-def analyze_stock_for_iron_condor(symbol, price_range_category):
+def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
     """
     Analyze a stock's suitability for iron condor strategies
     Returns: dict with analysis metrics
@@ -435,7 +430,7 @@ def scan_stocks_by_price_range(price_range_key, top_n=3):
     results.sort(key=lambda x: x['score'], reverse=True)
     return results[:top_n]
 
-def display_stock_suggestion(analysis):
+def analyze_stock_for_iron_condor(symbol, price_range_category):
     """Display a stock suggestion card"""
     
     # Determine heat level for styling
@@ -506,7 +501,21 @@ def display_stock_suggestion(analysis):
     </div>
     """, unsafe_allow_html=True)
 
-def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
+def calculate_historical_volatility(df, window=30):
+    """Calculate annualized historical volatility from price data"""
+    if len(df) < window:
+        window = len(df)
+    
+    # Calculate daily returns
+    df['returns'] = df['close'].pct_change()
+    
+    # Calculate standard deviation of returns
+    volatility = df['returns'].tail(window).std()
+    
+    # Annualize (252 trading days per year)
+    annual_volatility = volatility * np.sqrt(252)
+    
+    return annual_volatility
     try:
         opt = ticker_obj.option_chain(expiry_date)
         data = opt.calls if option_type == "call" else opt.puts
@@ -985,7 +994,12 @@ with st.expander("📚 Learn: What is an Iron Condor?", expanded=False):
 
 if symbol:
     try:
-        df = get_stock_data(symbol)
+        df = get_stock_data(symbol, days=days_back)
+        
+        if df is None or len(df) == 0:
+            st.error("Unable to fetch stock data. Please check the ticker symbol.")
+            st.stop()
+        
         current_price = df.iloc[-1]['close']
         
         # Calculate historical volatility automatically
@@ -1185,7 +1199,7 @@ if symbol:
             else:
                 st.info("👆 Click to scan the market for the best iron condor opportunities across all price ranges")
 
-        with tab3:
+        with tab4:
             st.markdown("### Technical Analysis")
             fig = make_subplots(
                 rows=2, cols=1, 
@@ -1249,29 +1263,39 @@ if symbol:
             
             st.plotly_chart(fig, use_container_width=True)
 
-        with tab3:
+        with tab4:
             st.markdown("### 📰 Latest Market News")
             news = get_news_data(symbol)
             if news:
                 for article in news:
-                    if isinstance(article, tuple): 
-                        article = article[1]
                     try:
+                        # Yahoo Finance news format
+                        title = article.get('title', 'No title')
+                        link = article.get('link', '#')
+                        publisher = article.get('publisher', 'Unknown')
+                        pub_time = article.get('providerPublishTime', 0)
+                        
+                        if pub_time:
+                            from datetime import datetime
+                            pub_date = datetime.fromtimestamp(pub_time).strftime('%Y-%m-%d %H:%M')
+                        else:
+                            pub_date = 'Unknown date'
+                        
                         st.markdown(f"""
                         <div class='info-card'>
-                            <h3>📄 {article.headline}</h3>
+                            <h3>📄 {title}</h3>
                             <p style='color: #a0a0a0; font-size: 0.9em;'>
-                                <strong>Source:</strong> {article.source} | 
-                                <strong>Date:</strong> {article.created_at.strftime('%Y-%m-%d %H:%M')}
+                                <strong>Source:</strong> {publisher} | 
+                                <strong>Date:</strong> {pub_date}
                             </p>
-                            <a href='{article.url}' target='_blank' style='color: #00d4ff;'>Read Full Article →</a>
+                            <a href='{link}' target='_blank' style='color: #00d4ff;'>Read Full Article →</a>
                         </div>
                         """, unsafe_allow_html=True)
-                    except: 
-                        pass
+                    except Exception as e:
+                        continue
             else:
                 st.markdown("<div class='alert-box alert-warning'>No recent news found for this symbol.</div>", unsafe_allow_html=True)
 
     except Exception as e:
         st.error(f"❌ Error loading data: {e}")
-        st.info("Please check your API credentials and try again.")
+        st.info("Please check your ticker symbol and try again. Make sure it's a valid stock symbol (e.g., SPY, AAPL, TSLA).")
