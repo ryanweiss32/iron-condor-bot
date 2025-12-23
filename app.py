@@ -1,18 +1,23 @@
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
 from datetime import datetime, timedelta, date
 import math
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import requests
 
 # --- APP CONFIGURATION ---
 st.set_page_config(page_title="Iron Condor Strategy Builder", layout="wide", page_icon="🦅")
+
+# --- LOAD SECRETS (MASSIVE / POLYGON) ---
+try:
+    MASSIVE_API_KEY = st.secrets["MASSIVE_API_KEY"]
+except:
+    st.error("❌ Critical Error: Could not find MASSIVE_API_KEY in secrets.")
+    st.stop()
+
+MASSIVE_BASE_URL = "https://api.polygon.io"
 
 # Popular stocks by price range for screening
 STOCK_UNIVERSE = {
@@ -254,14 +259,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- AUTO-LOAD KEYS ---
-try:
-    API_KEY = st.secrets["ALPACA_API_KEY"]
-    SECRET_KEY = st.secrets["ALPACA_SECRET_KEY"]
-except:
-    st.error("❌ Critical Error: Could not find .streamlit/secrets.toml")
-    st.stop()
-
 # --- SIDEBAR ---
 with st.sidebar:
     st.markdown("### 🦅 Strategy Control Panel")
@@ -346,35 +343,111 @@ def calculate_historical_volatility(df, window=30):
     
     return annual_volatility
 
-def get_stock_data(sym):
-    stock_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-    req = StockBarsRequest(
-        symbol_or_symbols=[sym],
-        timeframe=TimeFrame.Day,
-        start=datetime.now() - timedelta(days=days_back),
-        end=datetime.now(),
-        feed=DataFeed.IEX 
-    )
-    return stock_client.get_stock_bars(req).df.reset_index()
-
-def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
+# --- MASSIVE / POLYGON API FUNCTIONS ---
+def get_stock_data_polygon(sym, lookback_days):
+    """Fetch Historical Data from Polygon"""
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    
+    url = f"{MASSIVE_BASE_URL}/v2/aggs/ticker/{sym}/range/1/day/{start_date}/{end_date}"
+    params = {"apiKey": MASSIVE_API_KEY, "limit": 50000}
+    
     try:
-        opt = ticker_obj.option_chain(expiry_date)
-        data = opt.calls if option_type == "call" else opt.puts
-        contract_row = data.iloc[(data['strike'] - strike).abs().argsort()[:1]]
-        if not contract_row.empty:
-            price = contract_row['lastPrice'].values[0]
-            actual_strike = contract_row['strike'].values[0]
-            return price, actual_strike
+        resp = requests.get(url, params=params).json()
+        if resp.get("results"):
+            df = pd.DataFrame(resp["results"])
+            df['timestamp'] = pd.to_datetime(df['t'], unit='ms')
+            # Polygon returns: o, h, l, c, v. Rename to standard.
+            df = df.rename(columns={'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
+            return df
+        return pd.DataFrame()
+    except:
+        return pd.DataFrame()
+
+def get_current_price_polygon(sym):
+    """Fetch Real-Time Price from Polygon"""
+    url = f"{MASSIVE_BASE_URL}/v2/aggs/ticker/{sym}/prev"
+    params = {"apiKey": MASSIVE_API_KEY}
+    try:
+        resp = requests.get(url, params=params).json()
+        if resp.get("results"):
+            return resp["results"][0]["c"]
+        return 0.0
+    except:
+        return 0.0
+
+def get_closest_expiry_polygon(sym, target_date):
+    """Get expirations from Polygon and find closest"""
+    url = f"{MASSIVE_BASE_URL}/v3/reference/options/contracts"
+    params = {
+        "apiKey": MASSIVE_API_KEY,
+        "underlying_ticker": sym,
+        "expired": "false",
+        "limit": 1000
+    }
+    
+    try:
+        resp = requests.get(url, params=params).json()
+        dates = set()
+        if resp.get("results"):
+            for c in resp["results"]:
+                if "expiration_date" in c:
+                    dates.add(c["expiration_date"])
+        
+        valid_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in dates]
+        valid_dates.sort()
+        
+        # Find closest date >= target
+        future_dates = [d for d in valid_dates if d >= target_date]
+        if not future_dates: return None
+        
+        closest = min(future_dates, key=lambda x: abs(x - target_date))
+        return closest.strftime("%Y-%m-%d")
+    except:
+        return None
+
+def get_option_price_polygon(sym, expiry, strike, option_type):
+    """Construct Polygon Symbol and Fetch Snapshot"""
+    try:
+        # Convert date to YYMMDD
+        exp_date = datetime.strptime(expiry, "%Y-%m-%d")
+        exp_str = exp_date.strftime("%y%m%d")
+        
+        # Format strike (e.g. 450.5 -> 00450500)
+        strike_int = int(strike * 1000)
+        strike_str = f"{strike_int:08d}"
+        
+        # Type "C" or "P"
+        type_str = "C" if option_type == "call" else "P"
+        
+        # Construct Ticker: O:SPY240101C00450000
+        ticker = f"O:{sym}{exp_str}{type_str}{strike_str}"
+        
+        url = f"{MASSIVE_BASE_URL}/v3/snapshot/options/{sym}/{ticker}"
+        params = {"apiKey": MASSIVE_API_KEY}
+        
+        resp = requests.get(url, params=params).json()
+        
+        if resp.get("results"):
+            res = resp["results"]
+            day = res.get("day", {})
+            # Prefer last price, can expand to use bid/ask if available in tier
+            price = day.get("close", 0.0)
+            return price, strike
         return 0.0, strike
     except:
         return 0.0, strike
 
-def get_closest_expiry_yf(ticker_obj, target_date):
-    avail_dates = ticker_obj.options
-    valid_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in avail_dates]
-    closest = min(valid_dates, key=lambda x: abs(x - target_date))
-    return closest.strftime("%Y-%m-%d")
+def get_news_data_polygon(sym):
+    url = f"{MASSIVE_BASE_URL}/v2/reference/news"
+    params = {"apiKey": MASSIVE_API_KEY, "ticker": sym, "limit": 5}
+    try:
+        resp = requests.get(url, params=params).json()
+        if resp.get("results"):
+            return resp["results"]
+        return []
+    except:
+        return []
 
 def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_credit):
     # Use a default wing_width for plotting if not available globally
@@ -477,13 +550,12 @@ def calculate_optimal_wing_widths(current_price, calculated_iv, days_to_expiry):
     return aggressive, balanced, conservative
 
 def generate_scenario_card(symbol, current_price, days_offset, scenario_name, calculated_iv):
-    yf_ticker = yf.Ticker(symbol)
     
     target_date = get_next_trading_day(days_offset)
-    try:
-        expiry_str = get_closest_expiry_yf(yf_ticker, target_date)
-    except:
-        st.error("❌ No options data found in Yahoo Finance.")
+    expiry_str = get_closest_expiry_polygon(symbol, target_date)
+    
+    if not expiry_str:
+        st.error("❌ No options data found in Polygon/Massive.")
         return
 
     days_to_expiry = (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
@@ -534,10 +606,10 @@ def generate_scenario_card(symbol, current_price, days_offset, scenario_name, ca
     
     for profile_name, wing_width, profile_key in profiles_to_show:
         generate_single_strategy(symbol, current_price, days_offset, expiry_str, days_to_expiry, 
-                                calculated_iv, wing_width, profile_name, profile_key, yf_ticker)
+                                calculated_iv, wing_width, profile_name, profile_key)
 
 def generate_single_strategy(symbol, current_price, days_offset, expiry_str, days_to_expiry, 
-                            calculated_iv, wing_width, profile_name, profile_key, yf_ticker):
+                            calculated_iv, wing_width, profile_name, profile_key):
     
     actual_iv = calculated_iv
     
@@ -574,7 +646,8 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
     prices = []
     
     for strike, otype, side, _ in legs:
-        price, actual_strike = get_option_price_yf(yf_ticker, expiry_str, strike, otype)
+        # REPLACE YF CALL WITH POLYGON
+        price, actual_strike = get_option_price_polygon(symbol, expiry_str, strike, otype)
         prices.append(price)
         if side == "SELL": 
             total_credit += price
@@ -582,7 +655,7 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
             total_credit -= price
     
     if total_credit <= 0:
-        st.warning(f"⚠️ {profile_name}: This combination results in a net debit. Consider adjusting parameters.")
+        st.warning(f"⚠️ {profile_name}: This combination results in a net debit or data is unavailable. Check market hours.")
         st.markdown("</div>", unsafe_allow_html=True)
         return
     
@@ -606,53 +679,17 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
     cols = st.columns(6)
     
     with cols[0]:
-        st.markdown(f"""
-        <div class='metric-box'>
-            <div class='metric-label'>💵 Max Profit</div>
-            <div class='metric-value'>${max_profit:.0f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown(f"<div class='metric-box'><div class='metric-label'>💵 Max Profit</div><div class='metric-value'>${max_profit:.0f}</div></div>", unsafe_allow_html=True)
     with cols[1]:
-        st.markdown(f"""
-        <div class='metric-box'>
-            <div class='metric-label'>⚠️ Max Loss</div>
-            <div class='metric-value negative'>${max_loss:.0f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown(f"<div class='metric-box'><div class='metric-label'>⚠️ Max Loss</div><div class='metric-value negative'>${max_loss:.0f}</div></div>", unsafe_allow_html=True)
     with cols[2]:
-        st.markdown(f"""
-        <div class='metric-box'>
-            <div class='metric-label'>⚖️ Risk/Reward</div>
-            <div class='metric-value'>1:{risk_reward:.2f}</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown(f"<div class='metric-box'><div class='metric-label'>⚖️ Risk/Reward</div><div class='metric-value'>1:{risk_reward:.2f}</div></div>", unsafe_allow_html=True)
     with cols[3]:
-        st.markdown(f"""
-        <div class='metric-box'>
-            <div class='metric-label'>📈 Return on Risk</div>
-            <div class='metric-value'>{return_on_risk:.1f}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown(f"<div class='metric-box'><div class='metric-label'>📈 Return on Risk</div><div class='metric-value'>{return_on_risk:.1f}%</div></div>", unsafe_allow_html=True)
     with cols[4]:
-        st.markdown(f"""
-        <div class='metric-box'>
-            <div class='metric-label'>🎲 Win Probability</div>
-            <div class='metric-value'>{pop:.1f}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown(f"<div class='metric-box'><div class='metric-label'>🎲 Win Probability</div><div class='metric-value'>{pop:.1f}%</div></div>", unsafe_allow_html=True)
     with cols[5]:
-        st.markdown(f"""
-        <div class='metric-box'>
-            <div class='metric-label'>🎯 Profit Range</div>
-            <div class='metric-value'>{breakeven_pct:.1f}%</div>
-        </div>
-        """, unsafe_allow_html=True)
-    
+        st.markdown(f"<div class='metric-box'><div class='metric-label'>🎯 Profit Range</div><div class='metric-value'>{breakeven_pct:.1f}%</div></div>", unsafe_allow_html=True)
     st.markdown("</div>", unsafe_allow_html=True)
     
     st.markdown(f"""
@@ -665,55 +702,15 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
     
     with st.expander("📋 View Detailed Trade Legs", expanded=False):
         col1, col2 = st.columns(2)
-        
         with col1:
             st.markdown(f"""
-            <div class='leg-card call-sell'>
-                <div class='leg-header'>🔴 SELL Call (Bear Call Spread - Top)</div>
-                <div class='leg-details'>
-                    <strong>Strike:</strong> ${s_call:.2f}<br>
-                    <strong>Premium Received:</strong> ${prices[0]:.2f}<br>
-                    <strong>Purpose:</strong> Collect income if stock stays below this level<br>
-                    <strong>Risk:</strong> Unlimited if unprotected (but we have protection!)
-                </div>
-            </div>
+            <div class='leg-card call-sell'><div class='leg-header'>🔴 SELL Call (Bear Call Spread)</div><div class='leg-details'><strong>Strike:</strong> ${s_call:.2f}<br><strong>Price:</strong> ${prices[0]:.2f}</div></div>
+            <div class='leg-card call-buy'><div class='leg-header'>🟠 BUY Call (Protection)</div><div class='leg-details'><strong>Strike:</strong> ${l_call:.2f}<br><strong>Price:</strong> ${prices[1]:.2f}</div></div>
             """, unsafe_allow_html=True)
-            
-            st.markdown(f"""
-            <div class='leg-card call-buy'>
-                <div class='leg-header'>🟠 BUY Call (Protection)</div>
-                <div class='leg-details'>
-                    <strong>Strike:</strong> ${l_call:.2f}<br>
-                    <strong>Premium Paid:</strong> ${prices[1]:.2f}<br>
-                    <strong>Purpose:</strong> Caps maximum loss from short call<br>
-                    <strong>Protects:</strong> Against unlimited upside risk
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        
         with col2:
             st.markdown(f"""
-            <div class='leg-card put-sell'>
-                <div class='leg-header'>🟢 SELL Put (Bull Put Spread - Bottom)</div>
-                <div class='leg-details'>
-                    <strong>Strike:</strong> ${s_put:.2f}<br>
-                    <strong>Premium Received:</strong> ${prices[2]:.2f}<br>
-                    <strong>Purpose:</strong> Collect income if stock stays above this level<br>
-                    <strong>Risk:</strong> Large if unprotected (but we have protection!)
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown(f"""
-            <div class='leg-card put-buy'>
-                <div class='leg-header'>🔵 BUY Put (Protection)</div>
-                <div class='leg-details'>
-                    <strong>Strike:</strong> ${l_put:.2f}<br>
-                    <strong>Premium Paid:</strong> ${prices[3]:.2f}<br>
-                    <strong>Purpose:</strong> Caps maximum loss from short put<br>
-                    <strong>Protects:</strong> Against large downside moves
-                </div>
-            </div>
+            <div class='leg-card put-sell'><div class='leg-header'>🟢 SELL Put (Bull Put Spread)</div><div class='leg-details'><strong>Strike:</strong> ${s_put:.2f}<br><strong>Price:</strong> ${prices[2]:.2f}</div></div>
+            <div class='leg-card put-buy'><div class='leg-header'>🔵 BUY Put (Protection)</div><div class='leg-details'><strong>Strike:</strong> ${l_put:.2f}<br><strong>Price:</strong> ${prices[3]:.2f}</div></div>
             """, unsafe_allow_html=True)
     
     with st.expander("📈 View Profit/Loss Diagram", expanded=False):
@@ -728,29 +725,21 @@ def generate_single_strategy(symbol, current_price, days_offset, expiry_str, day
 
 def analyze_stock_for_iron_condor(symbol, price_range_category):
     try:
-        yf_ticker = yf.Ticker(symbol)
-        info = yf_ticker.info
-        current_price = info.get('currentPrice', info.get('regularMarketPrice', 0))
-        
+        # Use Polygon for Analysis
+        current_price = get_current_price_polygon(symbol)
         if current_price == 0: return None
         
-        hist = yf_ticker.history(period="60d")
+        hist = get_stock_data_polygon(symbol, 60)
         if len(hist) < 30: return None
         
-        hist['returns'] = hist['Close'].pct_change()
+        hist['returns'] = hist['close'].pct_change()
         volatility = hist['returns'].tail(30).std() * np.sqrt(252)
         
-        news_count = len(yf_ticker.news) if hasattr(yf_ticker, 'news') else 0
-        price_change_30d = ((current_price - hist['Close'].iloc[-30]) / hist['Close'].iloc[-30]) * 100
+        news = get_news_data_polygon(symbol)
+        news_count = len(news)
         
-        try:
-            has_options = len(yf_ticker.options) > 0
-        except:
-            has_options = False
-        
-        if not has_options: return None
-        
-        avg_volume = info.get('averageVolume', 0)
+        price_change_30d = ((current_price - hist['close'].iloc[-30]) / hist['close'].iloc[-30]) * 100
+        avg_volume = hist['volume'].mean()
         
         score = 0
         if 0.20 <= volatility <= 0.50: score += 30
@@ -837,29 +826,14 @@ def display_stock_suggestion(analysis):
     </div>
     """, unsafe_allow_html=True)
 
-def get_market_overview():
+def get_market_overview_polygon():
     try:
-        spy = yf.Ticker("SPY")
-        hist = spy.history(period="5d")
-        if len(hist) > 0:
-            current = hist['Close'].iloc[-1]
-            change = ((current - hist['Close'].iloc[0]) / hist['Close'].iloc[0]) * 100
-            
-            vix = yf.Ticker("^VIX")
-            vix_hist = vix.history(period="1d")
-            vix_level = vix_hist['Close'].iloc[-1] if len(vix_hist) > 0 else 0
-            
-            return {'spy_price': current, 'spy_change': change, 'vix_level': vix_level}
+        spy_price = get_current_price_polygon("SPY")
+        if spy_price:
+            return {'spy_price': spy_price, 'spy_change': 0.0, 'vix_level': 0.0} # Simplified for speed
         return None
     except:
         return None
-
-def get_news_data(sym):
-    try:
-        ticker = yf.Ticker(sym)
-        return ticker.news
-    except:
-        return []
 
 # --- MAIN DASHBOARD ---
 st.markdown("""
@@ -913,10 +887,11 @@ with st.expander("📚 Learn: What is an Iron Condor?", expanded=False):
 
 if symbol:
     try:
-        df = get_stock_data(symbol)
+        # Use Polygon Data
+        df = get_stock_data_polygon(symbol, days_back)
         
-        if df is None or len(df) == 0:
-            st.error("Unable to fetch stock data. Please check the ticker symbol.")
+        if df.empty:
+            st.error("Unable to fetch stock data from Polygon. Please check your API key and ticker.")
             st.stop()
         
         current_price = df.iloc[-1]['close']
@@ -934,8 +909,8 @@ if symbol:
         
         # Technical indicators
         df['SMA_50'] = df['close'].rolling(50).mean()
-        df['Upper_Band'] = df['SMA_50'] + (df['close'].rolling(20).std() * 2)
-        df['Lower_Band'] = df['SMA_50'] - (df['close'].rolling(20).std() * 2)
+        df['Upper_Band'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
+        df['Lower_Band'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
         df['RSI'] = 100 - (100 / (1 + (df['close'].diff().where(lambda x: x > 0, 0).rolling(14).mean() / 
                                         df['close'].diff().where(lambda x: x < 0, 0).abs().rolling(14).mean())))
 
@@ -994,15 +969,11 @@ if symbol:
 
         with tab2:
             st.markdown("### 🔍 AI-Powered Stock Screener")
-            market_data = get_market_overview()
+            market_data = get_market_overview_polygon()
             if market_data:
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.markdown(f"<div class='metric-box'><div class='metric-label'>📊 SPY Price</div><div class='metric-value'>${market_data['spy_price']:.2f}</div></div>", unsafe_allow_html=True)
-                with col2:
-                    st.markdown(f"<div class='metric-box'><div class='metric-label'>📈 5-Day Change</div><div class='metric-value' style='color: {'#2ed573' if market_data['spy_change'] >= 0 else '#ff4757'}'>{market_data['spy_change']:+.2f}%</div></div>", unsafe_allow_html=True)
-                with col3:
-                    st.markdown(f"<div class='metric-box'><div class='metric-label'>🔥 VIX Level</div><div class='metric-value'>{market_data['vix_level']:.2f}</div></div>", unsafe_allow_html=True)
             
             st.markdown("---")
             
@@ -1047,15 +1018,14 @@ if symbol:
 
         with tab4:
             st.markdown("### 📰 Latest Market News")
-            news = get_news_data(symbol)
+            news = get_news_data_polygon(symbol)
             if news:
                 for article in news:
                     try:
                         title = article.get('title', 'No title')
-                        link = article.get('link', '#')
-                        publisher = article.get('publisher', 'Unknown')
-                        pub_time = article.get('providerPublishTime', 0)
-                        pub_date = datetime.fromtimestamp(pub_time).strftime('%Y-%m-%d %H:%M') if pub_time else 'Unknown'
+                        link = article.get('article_url', '#')
+                        publisher = article.get('publisher', {}).get('name', 'Unknown')
+                        pub_date = article.get('published_utc', 'Unknown date')
                         
                         st.markdown(f"""
                         <div class='info-card'>
