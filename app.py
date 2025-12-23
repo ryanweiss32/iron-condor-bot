@@ -695,3 +695,53 @@ if symbol:
             # RSI
             fig.add_trace(go.Scatter(
                 x=df['timestamp'],
+                y=df['RSI'],
+                line=dict(color='#A020F0', width=2),
+                name='RSI'
+            ), row=2, col=1)
+            
+            # RSI levels
+            fig.add_hline(y=70, line_dash="dot", line_color="red", row=2, col=1, annotation_text="Overbought")
+            fig.add_hline(y=30, line_dash="dot", line_color="green", row=2, col=1, annotation_text="Oversold")
+            
+            fig.update_layout(
+                height=700,
+                template="plotly_dark",
+                xaxis_rangeslider_visible=False,
+                plot_bgcolor='#1a1a2e',
+                paper_bgcolor='#0f0f1e',
+                showlegend=True
+            )
+            
+            fig.update_xaxes(title_text="Date", row=2, col=1)
+            fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+            fig.update_yaxes(title_text="RSI", row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
+
+        with tab3:
+            st.markdown("### 📰 Latest Market News")
+            news = get_news_data(symbol)
+            if news:
+                for article in news:
+                    if isinstance(article, tuple): 
+                        article = article[1]
+                    try:
+                        st.markdown(f"""
+                        <div class='info-card'>
+                            <h3>📄 {article.headline}</h3>
+                            <p style='color: #a0a0a0; font-size: 0.9em;'>
+                                <strong>Source:</strong> {article.source} | 
+                                <strong>Date:</strong> {article.created_at.strftime('%Y-%m-%d %H:%M')}
+                            </p>
+                            <a href='{article.url}' target='_blank' style='color: #00d4ff;'>Read Full Article →</a>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    except: 
+                        pass
+            else:
+                st.markdown("<div class='alert-box alert-warning'>No recent news found for this symbol.</div>", unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"❌ Error loading data: {e}")
+        st.info("Please check your API credentials and try again.")
