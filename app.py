@@ -3,17 +3,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.historical.news import NewsClient
-from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, NewsRequest, OptionSnapshotRequest
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest
-from alpaca.trading.enums import AssetStatus, ContractType
+from alpaca.data.requests import StockBarsRequest, NewsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 from datetime import datetime, timedelta, date
 import math
 import pandas as pd
 import numpy as np
+import yfinance as yf  # <--- NEW DATA SOURCE
 
 # --- 1. APP CONFIGURATION ---
 st.set_page_config(page_title="Iron Condor Master", layout="wide", page_icon="🦅")
@@ -48,14 +45,12 @@ with st.sidebar:
     wing_width = st.slider("Wing Width ($)", 1, 10, 5, help="Width of the protection wings.")
     target_iv = st.number_input("Implied Volatility (Est.)", 0.1, 1.0, 0.15, step=0.01)
 
-# --- 4. HELPER FUNCTIONS ---
+# --- 4. MATH FUNCTIONS ---
 def get_next_trading_day(days_offset):
-    """Calculates target date skipping weekends."""
     target = date.today()
     added = 0
     while added < days_offset:
         target += timedelta(days=1)
-        # 5 = Saturday, 6 = Sunday
         if target.weekday() < 5:
             added += 1
     return target
@@ -94,33 +89,6 @@ def get_news_data(sym):
     except:
         return []
 
-def find_contract(client, underlying, strike, type, expiry):
-    try:
-        req = GetOptionContractsRequest(
-            underlying_symbol=[underlying],
-            status=AssetStatus.ACTIVE,
-            expiration_date=expiry,
-            type=type,
-            strike_price_gte=strike - 0.05, 
-            strike_price_lte=strike + 0.05,
-            limit=1
-        )
-        res = client.get_option_contracts(req)
-        if res.option_contracts:
-            return res.option_contracts[0]
-        return None
-    except:
-        return None
-
-def get_live_quotes(option_symbols):
-    if not option_symbols: return {}
-    client = OptionHistoricalDataClient(API_KEY, SECRET_KEY)
-    try:
-        req = OptionSnapshotRequest(symbol_or_symbols=option_symbols)
-        return client.get_option_snapshot(req)
-    except:
-        return {}
-
 def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_credit):
     min_price = long_put - (wing_width * 1.5)
     max_price = long_call + (wing_width * 1.5)
@@ -141,90 +109,108 @@ def plot_payoff(current_price, short_call, long_call, short_put, long_put, net_c
     fig.update_layout(title="Profit/Loss Diagram", template="plotly_dark", height=300, margin=dict(l=10, r=10, t=30, b=10))
     return fig
 
-# --- 5. LOGIC ENGINE FOR SCENARIOS ---
-def generate_scenario_card(trading_client, symbol, current_price, days_offset, scenario_name):
-    """Calculates and renders a single timeframe scenario."""
+# --- 5. YAHOO FINANCE LOGIC (The New Fix) ---
+def get_option_price_yf(ticker_obj, expiry_date, strike, option_type):
+    """
+    Fetches the LAST TRADED PRICE from Yahoo Finance for a specific option.
+    """
+    try:
+        # Get the option chain for that date
+        opt = ticker_obj.option_chain(expiry_date)
+        
+        # Select Calls or Puts table
+        data = opt.calls if option_type == "call" else opt.puts
+        
+        # Find the specific strike row
+        # We look for the strike closest to our target (within 0.5)
+        contract_row = data.iloc[(data['strike'] - strike).abs().argsort()[:1]]
+        
+        if not contract_row.empty:
+            # Use 'lastPrice' which works even when market is closed
+            price = contract_row['lastPrice'].values[0]
+            actual_strike = contract_row['strike'].values[0]
+            return price, actual_strike
+        return 0.0, strike
+    except Exception as e:
+        return 0.0, strike
+
+def get_closest_expiry_yf(ticker_obj, target_date):
+    """Finds the valid expiration date available in YF closest to our target."""
+    avail_dates = ticker_obj.options
+    # Convert strings 'YYYY-MM-DD' to date objects
+    valid_dates = [datetime.strptime(d, "%Y-%m-%d").date() for d in avail_dates]
     
-    # 1. Date Logic
-    expiry = get_next_trading_day(days_offset)
-    days_to_expiry = (expiry - date.today()).days
+    # Find closest
+    closest = min(valid_dates, key=lambda x: abs(x - target_date))
+    return closest.strftime("%Y-%m-%d")
+
+def generate_scenario_card(symbol, current_price, days_offset, scenario_name):
+    # 1. Setup Data
+    yf_ticker = yf.Ticker(symbol)
     
-    # 2. Strike Logic (Expected Move)
-    # Shorter time = Smaller Move = Tighter Spreads
+    # 2. Find Correct Expiry
+    target_date = get_next_trading_day(days_offset)
+    try:
+        # Yahoo Finance requires exact expiration strings
+        expiry_str = get_closest_expiry_yf(yf_ticker, target_date)
+    except:
+        st.error("No options data found in Yahoo Finance.")
+        return
+
+    days_to_expiry = (datetime.strptime(expiry_str, "%Y-%m-%d").date() - date.today()).days
+    if days_to_expiry < 1: days_to_expiry = 1
+    
+    # 3. Calculate Strikes
     move = current_price * target_iv * math.sqrt(days_to_expiry/365.0)
-    
     s_call = round_to_strike(current_price + move, 1.0)
     l_call = s_call + wing_width
     s_put = round_to_strike(current_price - move, 1.0)
     l_put = s_put - wing_width
     
-    # 3. Fetch Contracts
+    st.markdown(f"### {scenario_name} (Exp: {expiry_str})")
+    
+    # 4. Fetch Prices from Yahoo
+    # (Strike, Type, Side)
     legs = [
-        (s_call, ContractType.CALL, "SELL"),
-        (l_call, ContractType.CALL, "BUY"),
-        (s_put, ContractType.PUT, "SELL"),
-        (l_put, ContractType.PUT, "BUY")
+        (s_call, "call", "SELL"),
+        (l_call, "call", "BUY"),
+        (s_put, "put", "SELL"),
+        (l_put, "put", "BUY")
     ]
     
-    symbols = []
-    found_contracts = []
+    total_credit = 0.0
+    prices = []
     
-    for strike, ctype, side in legs:
-        c = find_contract(trading_client, symbol, strike, ctype, expiry)
-        if c: 
-            found_contracts.append(c)
-            symbols.append(c.symbol)
-            
-    # 4. Render UI
-    st.markdown(f"### {scenario_name} (Expires: {expiry})")
+    for strike, otype, side in legs:
+        price, actual_strike = get_option_price_yf(yf_ticker, expiry_str, strike, otype)
+        prices.append(price)
+        if side == "SELL": total_credit += price
+        else: total_credit -= price
     
-    if len(found_contracts) == 4:
-        quotes = get_live_quotes(symbols)
-        prices = []
-        total_credit = 0.0
+    # 5. Display
+    max_profit = total_credit * 100
+    max_loss = (wing_width * 100) - max_profit
+    pop = calculate_probability(current_price, s_call, s_put, target_iv, days_to_expiry)
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Max Profit", f"${max_profit:.0f}")
+    c2.metric("Max Loss", f"${max_loss:.0f}")
+    c3.metric("Win Prob", f"{pop:.1f}%")
+    
+    col_call, col_put = st.columns(2)
+    with col_call:
+        st.markdown(f"""<div class='trade-card call-side'>
+        <strong style='color:#FF5252'>Bear Call Side</strong><br>
+        Sell ${s_call} Call (~${prices[0]:.2f})<br>Buy ${l_call} Call (~${prices[1]:.2f})
+        </div>""", unsafe_allow_html=True)
+    with col_put:
+        st.markdown(f"""<div class='trade-card put-side'>
+        <strong style='color:#00E676'>Bull Put Side</strong><br>
+        Sell ${s_put} Put (~${prices[2]:.2f})<br>Buy ${l_put} Put (~${prices[3]:.2f})
+        </div>""", unsafe_allow_html=True)
         
-        for i, c in enumerate(found_contracts):
-            side = legs[i][2]
-            if c.symbol in quotes:
-                q = quotes[c.symbol].latest_quote
-                p = (q.ask_price + q.bid_price) / 2
-            else:
-                # Estimate
-                dist = abs(current_price - legs[i][0])
-                p = max(0.05, 5.0 - (dist * 0.1)) if dist < 20 else 0.05
-            
-            prices.append(p)
-            if side == "SELL": total_credit += p
-            else: total_credit -= p
-            
-        max_profit = total_credit * 100
-        max_loss = (wing_width * 100) - max_profit
-        pop = calculate_probability(current_price, s_call, s_put, target_iv, days_to_expiry)
-        
-        # Metrics
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Max Profit", f"${max_profit:.0f}")
-        c2.metric("Max Loss", f"${max_loss:.0f}")
-        c3.metric("Win Prob", f"{pop:.1f}%")
-        
-        # Cards
-        col_call, col_put = st.columns(2)
-        with col_call:
-            st.markdown(f"""<div class='trade-card call-side'>
-            <strong style='color:#FF5252'>Bear Call Side</strong><br>
-            Sell ${s_call} Call<br>Buy ${l_call} Call
-            </div>""", unsafe_allow_html=True)
-        with col_put:
-            st.markdown(f"""<div class='trade-card put-side'>
-            <strong style='color:#00E676'>Bull Put Side</strong><br>
-            Sell ${s_put} Put<br>Buy ${l_put} Put
-            </div>""", unsafe_allow_html=True)
-            
-        with st.expander("See Graph"):
-             st.plotly_chart(plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), use_container_width=True)
-             
-    else:
-        st.warning(f"Market data unavailable for {expiry}. (Exchanges might be closed or contracts don't exist yet).")
+    with st.expander("See Graph"):
+         st.plotly_chart(plot_payoff(current_price, s_call, l_call, s_put, l_put, total_credit), use_container_width=True)
 
 
 # --- 6. MAIN DASHBOARD ---
@@ -232,6 +218,7 @@ st.title(f"🦅 {symbol} Multi-Timeframe Analyzer")
 
 if symbol:
     try:
+        # Load Stock Data (Alpaca is still great for this)
         df = get_stock_data(symbol)
         current_price = df.iloc[-1]['close']
         
@@ -245,28 +232,26 @@ if symbol:
         tab1, tab2, tab3 = st.tabs(["📊 Trade Builder", "📉 Chart", "📰 News"])
 
         with tab1:
-            st.write(f"Current Price: **${current_price:.2f}** | Generating 3 distinct strategies...")
+            st.write(f"Current Price: **${current_price:.2f}** | Data Source: Yahoo Finance (Last Closing Price)")
             
             if st.button("🔴 GENERATE ALL SCENARIOS"):
-                trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
                 
-                # We use Tabs within the result area for cleaner look
                 t1, t2, t3 = st.tabs(["1 Day (Gamma Scalp)", "2 Days (Swing)", "7 Days (Standard)"])
                 
                 with t1:
-                    with st.spinner("Analyzing 1-Day Options..."):
-                        generate_scenario_card(trading_client, symbol, current_price, 1, "1-Day Expiry")
+                    with st.spinner("Fetching Yahoo Finance Data..."):
+                        generate_scenario_card(symbol, current_price, 1, "1-Day Expiry")
                 
                 with t2:
-                    with st.spinner("Analyzing 2-Day Options..."):
-                        generate_scenario_card(trading_client, symbol, current_price, 2, "2-Day Expiry")
+                    with st.spinner("Fetching Yahoo Finance Data..."):
+                        generate_scenario_card(symbol, current_price, 2, "2-Day Expiry")
                         
                 with t3:
-                    with st.spinner("Analyzing Weekly Options..."):
-                        generate_scenario_card(trading_client, symbol, current_price, 7, "7-Day Expiry")
+                    with st.spinner("Fetching Yahoo Finance Data..."):
+                        generate_scenario_card(symbol, current_price, 7, "7-Day Expiry")
 
             else:
-                st.info("Click the button to fetch live data for all timeframes.")
+                st.info("Click the button to fetch last known market prices.")
 
         with tab2:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.7, 0.3])
