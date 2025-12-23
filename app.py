@@ -651,11 +651,7 @@ for strat in strategies:
         
         st.markdown('</div>', unsafe_allow_html=True)
 
-# Profit Diagram 
-
-[Image of Iron Condor payoff diagram]
-
-# Creating dynamic Plotly chart instead of static image for better user experience
+# Profit Diagram
 st.markdown("### 📊 Profit/Loss Diagram (Balanced Strategy)")
 
 def plot_payoff(strategy):
